@@ -1,3 +1,4 @@
+
 resource "aws_iam_role" "lambda_exec" {
   name = "${local.name_prefix}-lambda-exec"
 
@@ -41,6 +42,10 @@ resource "aws_lambda_function" "registrar_servicio" {
   memory_size   = 256
   timeout       = 15
 
+  tracing_config {
+    mode = "Active"
+  }
+
   filename         = "${path.module}/../build/registrar_servicio.zip"
   source_code_hash = filebase64sha256("${path.module}/../build/registrar_servicio.zip")
 
@@ -76,6 +81,10 @@ resource "aws_lambda_function" "consultar_servicio" {
   handler       = "lambda_function.lambda_handler"
   memory_size   = 256
   timeout       = 15
+
+  tracing_config {
+    mode = "Active"
+  }
 
   filename         = "${path.module}/../build/consultar_servicio.zip"
   source_code_hash = filebase64sha256("${path.module}/../build/consultar_servicio.zip")
