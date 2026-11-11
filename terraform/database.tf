@@ -15,24 +15,26 @@ resource "aws_db_instance" "postgres" {
   identifier = "${local.name_prefix}-postgres"
 
   # RDS selects the current default PostgreSQL version for this region.
-  engine         = "postgres"
-  instance_class = "db.t4g.micro"
-  db_name        = "servitech"
-  port           = 5432
-
-  allocated_storage = 20
-  storage_type      = "gp3"
-  storage_encrypted = true
+  engine                          = "postgres"
+  instance_class                  = "db.t4g.micro"
+  db_name                         = "servitech"
+  port                            = 5432
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+  allocated_storage               = 20
+  storage_type                    = "gp3"
+  storage_encrypted               = true
 
   username                    = "servitech_admin"
   manage_master_user_password = true
 
-  db_subnet_group_name   = aws_db_subnet_group.servitech.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  publicly_accessible    = false
-  multi_az               = false
+  db_subnet_group_name       = aws_db_subnet_group.servitech.name
+  vpc_security_group_ids     = [aws_security_group.rds.id]
+  publicly_accessible        = false
+  multi_az                   = false
+  auto_minor_version_upgrade = true
 
   backup_retention_period   = 7
+  copy_tags_to_snapshot     = true
   skip_final_snapshot       = false
   final_snapshot_identifier = "${local.name_prefix}-postgres-final"
 

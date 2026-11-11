@@ -125,3 +125,11 @@ resource "aws_vpc_endpoint" "secrets_manager" {
     Name = "${local.name_prefix}-secrets-manager-endpoint"
   }
 }
+
+
+
+
+
+resource "aws_default_security_group" "default" {
+  vpc_id = aws_vpc.main.id
+}
