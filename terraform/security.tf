@@ -14,6 +14,7 @@ resource "aws_security_group" "lambda" {
 
 # Las Lambdas pueden iniciar conexiones hacia otros recursos.
 resource "aws_vpc_security_group_egress_rule" "lambda_all" {
+  description       = "Permite trafico saliente de las Lambdas"
   security_group_id = aws_security_group.lambda.id
 
   cidr_ipv4   = "0.0.0.0/0"
@@ -36,15 +37,15 @@ resource "aws_security_group" "rds" {
 
 # PostgreSQL solamente acepta conexiones desde las Lambdas.
 resource "aws_vpc_security_group_ingress_rule" "rds_from_lambda" {
-  security_group_id = aws_security_group.rds.id
+  description = "Permite PostgreSQL desde Lambda hacia RDS"
 
+  security_group_id = aws_security_group.rds.id
   referenced_security_group_id = aws_security_group.lambda.id
 
   from_port   = 5432
   to_port     = 5432
   ip_protocol = "tcp"
 }
-
 # ============================================================
 # SECURITY GROUP - VPC ENDPOINT SECRETS MANAGER
 # ============================================================
@@ -61,6 +62,7 @@ resource "aws_security_group" "secrets_endpoint" {
 
 # El endpoint acepta HTTPS solamente desde las Lambdas.
 resource "aws_vpc_security_group_ingress_rule" "secrets_from_lambda" {
+  description       = "Permite HTTPS desde Lambda hacia Secrets Manager"
   security_group_id = aws_security_group.secrets_endpoint.id
 
   referenced_security_group_id = aws_security_group.lambda.id
