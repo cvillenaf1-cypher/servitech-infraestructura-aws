@@ -19,7 +19,7 @@ resource "aws_db_instance" "postgres" {
   instance_class = "db.t4g.micro"
   db_name        = "servitech"
   port           = 5432
-
+enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
   allocated_storage = 20
   storage_type      = "gp3"
   storage_encrypted = true
