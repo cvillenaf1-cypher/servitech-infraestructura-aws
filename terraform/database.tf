@@ -31,6 +31,7 @@ enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
   vpc_security_group_ids = [aws_security_group.rds.id]
   publicly_accessible    = false
   multi_az               = false
+  auto_minor_version_upgrade = true
 
   backup_retention_period   = 7
   skip_final_snapshot       = false
