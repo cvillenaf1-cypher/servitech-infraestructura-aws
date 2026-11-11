@@ -34,6 +34,7 @@ enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
   auto_minor_version_upgrade = true
 
   backup_retention_period   = 7
+  copy_tags_to_snapshot = true
   skip_final_snapshot       = false
   final_snapshot_identifier = "${local.name_prefix}-postgres-final"
 
