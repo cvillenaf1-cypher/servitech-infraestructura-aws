@@ -5,7 +5,7 @@ resource "aws_api_gateway_rest_api" "servitech" {
   endpoint_configuration {
     types = ["REGIONAL"]
   }
-  
+
   lifecycle {
     create_before_destroy = true
   }

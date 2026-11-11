@@ -39,7 +39,7 @@ resource "aws_security_group" "rds" {
 resource "aws_vpc_security_group_ingress_rule" "rds_from_lambda" {
   description = "Permite PostgreSQL desde Lambda hacia RDS"
 
-  security_group_id = aws_security_group.rds.id
+  security_group_id            = aws_security_group.rds.id
   referenced_security_group_id = aws_security_group.lambda.id
 
   from_port   = 5432
