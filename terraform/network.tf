@@ -126,9 +126,18 @@ resource "aws_vpc_endpoint" "secrets_manager" {
   }
 }
 
+resource "aws_vpc_endpoint" "eventbridge" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.events"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = [aws_subnet.private_app_a.id, aws_subnet.private_app_b.id]
+  security_group_ids  = [aws_security_group.eventbridge_endpoint.id]
 
-
-
+  tags = {
+    Name = "${local.name_prefix}-eventbridge-endpoint"
+  }
+}
 
 resource "aws_default_security_group" "default" {
   vpc_id = aws_vpc.main.id
