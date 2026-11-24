@@ -152,6 +152,80 @@ Start-Process $frontendUrl
 Usar CloudFront para acceder al sitio; el bucket S3 es privado. Si aparece el
 aviso de API sin configurar, completar la dependencia de frontend indicada arriba.
 
+## Contrato de RDS Proxy
+
+RDS Proxy usa las dos subredes privadas de datos, el SG `aws_security_group.rds_proxy`
+y la instancia Multi-AZ `aws_db_instance.postgres`. El proxy exige IAM y TLS a
+los clientes. Para abrir sesiones en PostgreSQL usa el secreto de `servitech_app`.
+Las dos Lambda del MVP conservan su ruta directa durante la transición.
+
+### Preparación para el despliegue
+
+1. En un entorno nuevo, aprovisionar primero la red y la instancia privada
+   Multi-AZ con la configuración de la fase 1, anterior a los recursos y
+   variables del proxy. Usar el backend y workspace previstos para el
+   entorno. Esperar a que RDS esté disponible y conservar ese mismo estado
+   para incorporar la fase 2.
+2. Desde una ruta administrativa autorizada en la VPC, crear el rol PostgreSQL
+   `servitech_app` con `LOGIN` y contraseña generada de forma segura. Conceder
+   `CONNECT` a `servitech` y, cuando exista el esquema, solo los permisos de
+   esquema, tablas y secuencias que requieran las operaciones de aplicación.
+   Reservar el DDL para el rol de migraciones y mantener la autenticación por
+   contraseña para `servitech_app` sin pertenencia a `rds_iam`.
+3. Crear en Secrets Manager un secreto dedicado en la misma cuenta y región.
+   Su versión `AWSCURRENT` debe contener las claves JSON `username` y
+   `password`, con `servitech_app` y la contraseña vigente del rol. Coordinar
+   la rotación de ambas credenciales. Pasar solo el ARN completo mediante
+   `TF_VAR_database_app_secret_arn`. Si el secreto usa una clave KMS propia, proporcionar su ARN por
+   `TF_VAR_database_app_secret_kms_key_arn` y autorizar el rol del proxy en la
+   política de clave. Mantener los valores del secreto fuera de Terraform.
+4. Con el rol SQL y el secreto ya disponibles, incorporar la fase 2 al mismo
+   entorno para aprovisionar el rol IAM y el proxy sobre la instancia existente.
+   Confirmar que el rol de despliegue puede crear los recursos de proxy e IAM
+   y que tiene `iam:PassRole` para el rol dedicado. Verificar la región, versión
+   de PostgreSQL, IDs de zona compatibles con RDS Proxy e IP libres en las
+   subredes. Conservar la base predeterminada `postgres` que requiere el proxy.
+   Tras un despliegue autorizado, verificar que el destino esté disponible.
+
+`database_app_secret_arn` es una variable obligatoria. Los workflows
+`deploy-dev.yml` y `destroy-dev.yml` actualmente solo inyectan la región como
+variable de Terraform. Cuando ejecuten la configuración de esta fase, sus
+planes con `-input=false` fallarán hasta que el entorno de ambos jobs reciba
+`TF_VAR_database_app_secret_arn` con el ARN real. Si se usa una clave propia,
+proporcionar también su ARN al desplegar. `terraform validate` comprueba la
+configuración sin exigir el valor de la variable.
+
+El pool empieza con un máximo del 80 % de `max_connections` para dejar margen
+al acceso directo del MVP y a la administración. Mantiene hasta un 40 % de
+`max_connections` en conexiones ociosas para reutilizarlas. La espera para
+obtener una conexión es de 5 s para dejar margen dentro del timeout de 15 s del
+MVP. El proxy cierra clientes inactivos tras 300 s. Ajustar estos valores
+después de medir el uso y la latencia de préstamo en el entorno real.
+
+### Integración de las Lambda 1–4
+
+- Usar las subredes privadas de aplicación y
+  `aws_security_group.rds_proxy_client.id` (output
+  `database_proxy_client_security_group_id`). Para Lambda 4, añadir
+  `aws_security_group.lambda4_publisher.id` para el endpoint de EventBridge.
+- Configurar `DB_HOST` con `database_proxy_endpoint`
+  (`aws_db_proxy.postgres.endpoint`), `DB_PORT` con `database_port` (5432),
+  `DB_NAME` con `database_name` (`servitech`) y `DB_USER` con
+  `database_app_username` (`servitech_app`). Configurar `DB_SSLROOTCERT` con
+  la ruta al PEM de raíces de Amazon Trust Services disponible en el paquete.
+- Generar el token IAM con el SDK para cada conexión física nueva usando el
+  hostname real del proxy, puerto, usuario y región efectiva (`AWS_REGION`).
+  Pasar el token como contraseña al driver y usar `sslmode=verify-full` con
+  `sslrootcert` apuntando al PEM. Mantener los tokens fuera de los logs.
+- Autorizar `rds-db:connect` en cada rol consumidor usando como recurso
+  exclusivo `database_proxy_connect_arn`. Ese ARN usa el ID `prx-...` y
+  `servitech_app`. Los outputs `database_proxy_arn` y `database_instance_arn`
+  identifican los recursos de infraestructura.
+- Antes de migrar las dos Lambda existentes, preparar el esquema y retirar
+  su DDL de arranque. Verificar registro y consulta por el proxy antes de
+  retirar, en una fase posterior, las reglas directas del MVP y su permiso
+  de lectura del secreto maestro.
+
 ## Prueba de registro y consulta
 
 Cada ejecución del script crea un registro real de prueba. Desde la raíz:
