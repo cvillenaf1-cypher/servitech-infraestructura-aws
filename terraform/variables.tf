@@ -15,3 +15,25 @@ variable "project_name" {
   type        = string
   default     = "servitech"
 }
+
+variable "database_app_secret_arn" {
+  description = "ARN completo del secreto existente de servitech_app en Secrets Manager."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:[^:]+-[A-Za-z0-9]{6}$", var.database_app_secret_arn))
+    error_message = "Indica el ARN completo del secreto, incluido el sufijo de Secrets Manager."
+  }
+}
+
+variable "database_app_secret_kms_key_arn" {
+  description = "ARN de la clave KMS administrada por el cliente que cifra el secreto, si corresponde."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.database_app_secret_kms_key_arn == null || can(regex("^arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[^:/]+$", var.database_app_secret_kms_key_arn))
+    error_message = "Indica el ARN de una clave KMS o usa null para aws/secretsmanager."
+  }
+}

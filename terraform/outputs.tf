@@ -27,3 +27,43 @@ output "environment" {
   description = "Workspace actual de Terraform."
   value       = terraform.workspace
 }
+
+output "database_proxy_endpoint" {
+  description = "Hostname privado del proxy PostgreSQL."
+  value       = aws_db_proxy.postgres.endpoint
+}
+
+output "database_proxy_arn" {
+  description = "ARN del proxy PostgreSQL."
+  value       = aws_db_proxy.postgres.arn
+}
+
+output "database_port" {
+  description = "Puerto PostgreSQL."
+  value       = aws_db_instance.postgres.port
+}
+
+output "database_name" {
+  description = "Nombre de la base PostgreSQL de aplicación."
+  value       = aws_db_instance.postgres.db_name
+}
+
+output "database_app_username" {
+  description = "Usuario PostgreSQL de aplicación."
+  value       = local.database_app_username
+}
+
+output "database_proxy_client_security_group_id" {
+  description = "ID del Security Group de las Lambda que consumen RDS Proxy."
+  value       = aws_security_group.rds_proxy_client.id
+}
+
+output "database_proxy_connect_arn" {
+  description = "Recurso exacto para rds-db:connect de los roles consumidores del proxy."
+  value       = replace(aws_db_proxy.postgres.arn, "/^arn:([^:]+):rds:([^:]+):([^:]+):db-proxy:(prx-[^:]+)$/", "arn:$1:rds-db:$2:$3:dbuser:$4/${local.database_app_username}")
+}
+
+output "database_instance_arn" {
+  description = "ARN de la instancia RDS PostgreSQL."
+  value       = aws_db_instance.postgres.arn
+}
