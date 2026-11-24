@@ -161,35 +161,44 @@ Las dos Lambda del MVP conservan su ruta directa durante la transición.
 
 ### Preparación para el despliegue
 
-1. En un entorno nuevo, aprovisionar primero la red y la instancia privada
-   Multi-AZ con la configuración de la fase 1, anterior a los recursos y
-   variables del proxy. Usar el backend y workspace previstos para el
-   entorno. Esperar a que RDS esté disponible y conservar ese mismo estado
-   para incorporar la fase 2.
-2. Instalar el esquema y aprovisionar `servitech_app` desde una ruta
-   administrativa privada siguiendo el procedimiento de la sección SQL.
-3. Crear en Secrets Manager un secreto dedicado en la misma cuenta y región.
-   Su versión `AWSCURRENT` debe contener las claves JSON `username` y
-   `password`, con `servitech_app` y la contraseña vigente del rol. Coordinar
-   la rotación de ambas credenciales. Pasar solo el ARN completo mediante
-   `TF_VAR_database_app_secret_arn`. Si el secreto usa una clave KMS propia, proporcionar su ARN por
-   `TF_VAR_database_app_secret_kms_key_arn` y autorizar el rol del proxy en la
-   política de clave. Mantener los valores del secreto fuera de Terraform.
-4. Con el rol SQL y el secreto ya disponibles, incorporar la fase 2 al mismo
-   entorno para aprovisionar el rol IAM y el proxy sobre la instancia existente.
-   Confirmar que el rol de despliegue puede crear los recursos de proxy e IAM
-   y que tiene `iam:PassRole` para el rol dedicado. Verificar la región, versión
-   de PostgreSQL, IDs de zona compatibles con RDS Proxy e IP libres en las
-   subredes. Conservar la base predeterminada `postgres` que requiere el proxy.
-   Tras un despliegue autorizado, verificar que el destino esté disponible.
+1. Para un entorno nuevo, generar la contraseña fuera de Terraform y
+   preregistrar el secreto dedicado en Secrets Manager, en la misma cuenta
+   y región. Su versión `AWSCURRENT` contiene `username` igual a
+   `servitech_app` y `password` con esa credencial. El secreto puede existir
+   antes que el usuario PostgreSQL. Entregar solo su ARN mediante
+   `TF_VAR_database_app_secret_arn`. Si usa una clave KMS propia, entregar
+   también `TF_VAR_database_app_secret_kms_key_arn` y coordinar la política
+   de clave para el rol del proxy.
+2. Con el código actual, los paquetes Lambda y el backend y workspace
+   previstos, preparar un primer plan manual de arranque limitado a RDS y
+   sus dependencias con `terraform plan -input=false -target=aws_db_instance.postgres`.
+   Usar ese alcance solo para este arranque excepcional. Revisar y autorizar
+   el plan antes de ejecutarlo. Esperar a que la instancia privada Multi-AZ
+   esté disponible y conservar el mismo estado para el plan completo.
+3. Instalar el esquema y aprovisionar `servitech_app` desde una ruta
+   administrativa privada siguiendo la sección SQL. Asignarle mediante
+   el prompt interactivo la misma contraseña del secreto ya registrado.
+   Confirmar que el rol puede iniciar sesión antes de crear el proxy.
+4. Preparar y revisar un plan completo, sin `-target`, con el mismo código,
+   backend, workspace y ARN de secreto. Confirmar `iam:PassRole` para el
+   rol dedicado, la versión de PostgreSQL, los IDs de zona compatibles
+   con RDS Proxy y las IP libres. Conservar la base predeterminada
+   `postgres`. Tras un despliegue autorizado, verificar la salud del
+   destino y probar una conexión IAM con verificación TLS.
 
 `database_app_secret_arn` es una variable obligatoria. Los workflows
 `deploy-dev.yml` y `destroy-dev.yml` actualmente solo inyectan la región como
 variable de Terraform. Cuando ejecuten la configuración de esta fase, sus
 planes con `-input=false` fallarán hasta que el entorno de ambos jobs reciba
-`TF_VAR_database_app_secret_arn` con el ARN real. Si se usa una clave propia,
-proporcionar también su ARN al desplegar. `terraform validate` comprueba la
-configuración sin exigir el valor de la variable.
+`TF_VAR_database_app_secret_arn` con el ARN real. Para una actualización
+posterior de CI, configurar el ARN como variable del entorno de GitHub
+`dev` y mapearla al mismo `TF_VAR_` en ambos jobs. Mapear el ARN KMS cuando
+corresponda y conservar el secreto y su configuración hasta que se retire
+el proxy. El primer arranque requiere la pausa manual del paso 3 antes de
+habilitar el despliegue automático. `terraform validate` comprueba la
+configuración sin exigir el valor de la variable. Confirmar el workspace
+efectivo antes de operar, porque los workflows declaran `default` y la
+guía histórica del MVP usa `dev`.
 
 El pool empieza con un máximo del 80 % de `max_connections` para dejar margen
 al acceso directo del MVP y a la administración. Mantiene hasta un 40 % de
@@ -198,7 +207,7 @@ obtener una conexión es de 5 s para dejar margen dentro del timeout de 15 s del
 MVP. El proxy cierra clientes inactivos tras 300 s. Ajustar estos valores
 después de medir el uso y la latencia de préstamo en el entorno real.
 
-### Integración de las Lambda 1–4
+### Gordillo · conexión de las Lambda 1–4
 
 - Usar las subredes privadas de aplicación y
   `aws_security_group.rds_proxy_client.id` (output
@@ -263,8 +272,10 @@ contador de cambios de estado.
 
 1. Usar una sesión administrativa autorizada con conectividad privada hacia
    el endpoint directo de RDS, desde un equipo con acceso privado a la VPC
-   o desde un cliente de administración autorizado dentro de ella. Verificar
-   el certificado de RDS y su hostname con `sslmode=verify-full` y el bundle
+   o desde un cliente de administración autorizado dentro de ella. Antes de
+   operar, coordinar una ruta privada y acceso TCP 5432 desde ese cliente.
+   Las reglas actuales solo permiten los SG del MVP y del proxy hacia RDS.
+   Verificar el certificado y el hostname de RDS con `sslmode=verify-full` y el bundle
    de CA de RDS. Ejecutar primero el esquema con la identidad de migración.
 2. Con una identidad autorizada para administrar roles y otorgar privilegios
    en `servitech`, ejecutar una vez `psql -X -v ON_ERROR_STOP=1 -f
@@ -274,8 +285,9 @@ contador de cambios de estado.
    script detecta `CREATE` efectivo heredado de `PUBLIC` en la base o el
    esquema, el administrador debe revisar esos permisos antes de repetirlo.
 3. Generar la contraseña en un gestor seguro. Asignarla mediante el prompt
-   interactivo `\password servitech_app` de psql. Guardar la misma
-   credencial en Secrets Manager en el secreto dedicado descrito arriba.
+   interactivo `\password servitech_app` de psql. Si el secreto ya se registró
+   para el arranque, usar su contraseña vigente. Guardar la misma credencial
+   en el secreto dedicado al aprovisionar uno por primera vez.
    Mantener la contraseña fuera de SQL, archivos y argumentos de comandos.
    Habilitar el acceso con `ALTER ROLE servitech_app LOGIN;` una vez que el
    secreto esté listo. Comprobar que la versión vigente del secreto coincide
@@ -320,16 +332,32 @@ se sustituyen por enteros JSON.
 
 1. En la transacción de `ActualizarEstado`, bloquear el servicio y comprobar
    la versión esperada. Actualizar el estado y la versión, insertar el historial
-   e insertar el outbox con la misma pareja `(servicio_id, version)`. Construir
-   el detalle con el nuevo estado, el propietario y el número verificado de
-   la fuente autorizada. El SQL valida el formato E.164. Si faltan los datos
-   requeridos o falla alguna escritura, revertir la transacción completa.
+   e insertar el outbox con la misma pareja `(servicio_id, version)`. Derivar
+   `servicio_id`, `version` y `estado` de la fila de historial creada y
+   `cliente_sub` de la fila de servicio bloqueada, en vez de aceptar esos
+   valores por separado en la petición. La FK garantiza la pareja
+   servicio-versión. La correspondencia de estado y propietario depende de
+   esta escritura. Obtener el teléfono desde la fuente autorizada. El SQL
+   valida el formato E.164. Si faltan los datos requeridos o falla alguna
+   escritura, revertir la transacción completa.
 2. Tras el `COMMIT`, cualquier publicador inmediato debe usar el mismo
    mecanismo de reserva que los reintentos. Usar `PutEvents` únicamente
    después de confirmar también la transacción de reserva, con la sesión
    PostgreSQL fuera de transacción.
 
-### Jhonatan · despacho y reintentos
+### Jhonatan · AWS Backup, despacho y reintentos
+
+- Para seleccionar RDS en AWS Backup, usar el output `database_instance_arn`
+  (`aws_db_instance.postgres.arn`). El identificador es
+  `aws_db_instance.postgres.identifier`, de forma
+  `${local.name_prefix}-postgres`, y figura al final de ese ARN tras
+  `:db:`. Validar la clave KMS y la configuración de cuentas antes de
+  implementar la copia centralizada.
+- La Página 3 prevé que EventBridge Scheduler invoque la Lambda 4 cada
+  minuto mediante IAM para despachar pendientes. Coordinar con Gordillo
+  una entrada de despacho que use el mismo mecanismo de reserva que la
+  publicación inmediata. El rol de Scheduler deberá poder invocar esa
+  función. El contrato JSON está en la tabla anterior.
 
 Reservar un lote pequeño en una transacción corta. `$1` es el tamaño
 positivo del lote y `$2` es una duración positiva de reserva, suficiente
