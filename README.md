@@ -166,12 +166,8 @@ Las dos Lambda del MVP conservan su ruta directa durante la transición.
    variables del proxy. Usar el backend y workspace previstos para el
    entorno. Esperar a que RDS esté disponible y conservar ese mismo estado
    para incorporar la fase 2.
-2. Desde una ruta administrativa autorizada en la VPC, crear el rol PostgreSQL
-   `servitech_app` con `LOGIN` y contraseña generada de forma segura. Conceder
-   `CONNECT` a `servitech` y, cuando exista el esquema, solo los permisos de
-   esquema, tablas y secuencias que requieran las operaciones de aplicación.
-   Reservar el DDL para el rol de migraciones y mantener la autenticación por
-   contraseña para `servitech_app` sin pertenencia a `rds_iam`.
+2. Instalar el esquema y aprovisionar `servitech_app` desde una ruta
+   administrativa privada siguiendo el procedimiento de la sección SQL.
 3. Crear en Secrets Manager un secreto dedicado en la misma cuenta y región.
    Su versión `AWSCURRENT` debe contener las claves JSON `username` y
    `password`, con `servitech_app` y la contraseña vigente del rol. Coordinar
@@ -225,6 +221,64 @@ después de medir el uso y la latencia de préstamo en el entorno real.
   su DDL de arranque. Verificar registro y consulta por el proxy antes de
   retirar, en una fase posterior, las reglas directas del MVP y su permiso
   de lectura del secreto maestro.
+
+## Esquema PostgreSQL e historial
+
+En una instalación nueva, el rol de migraciones ejecuta `psql -X -v
+ON_ERROR_STOP=1 -f sql/schema.sql` sobre la base `servitech`. Este punto de
+entrada de psql crea la tabla base e incluye la migración. Si el MVP ya creó
+`public.servicios`, ejecutar `psql -X -v ON_ERROR_STOP=1 -f
+sql/migrations/001_servicios_historial.sql`. La migración aplica sus cambios
+en una transacción y se puede volver a ejecutar sobre el mismo esquema.
+Coordinar la ventana porque `ALTER TABLE` puede bloquear temporalmente el
+acceso y la creación de índices puede tardar según el volumen.
+
+| Tabla | Contrato |
+| --- | --- |
+| `public.servicios` | Conserva `id` entero autogenerado, `cliente`, `equipo`, `descripcion` y `fecha_registro`. Añade `numero_serie` (texto), `fecha_recepcion` (timestamp con zona), `diagnostico` y `tratamiento` (texto), `presupuesto` (importe numérico finito y no negativo), `estado` (texto), `version` (entero de 64 bits, inicialmente 0), `cliente_sub` (identificador de propietario, `clienteSub` en el contrato de aplicación) y `sede_id` (identificador de sede). Los campos nuevos salvo `version` admiten NULL, de modo que los registros e INSERT del MVP siguen siendo válidos. |
+| `public.servicio_estado_historial` | Una fila por versión de cambio de estado. Clave primaria `(servicio_id, version)`, que también indexa el historial por servicio y versión. `servicio_id` referencia a `servicios.id` y `version` es positiva. `estado_anterior` admite NULL para un servicio sin estado previo. `estado_nuevo` es obligatorio. `actor_sub` admite NULL y `cambiado_en` se genera en la base. |
+
+`RegistrarServicio` debe enviar los datos de recepción y propiedad que tenga
+verificados. `ConsultarServicio` puede filtrar por `cliente_sub` y `sede_id`
+mediante los índices previstos y debe aplicar las reglas de acceso del equipo
+con la identidad autenticada. Un campo de propiedad o sede nulo requiere
+resolución antes de usarlo como evidencia de acceso. Quedan por definir el
+catálogo y las transiciones de estados, la moneda del presupuesto, el
+catálogo de sedes y la fuente de roles. El SQL deja esos valores a la
+integración de aplicación.
+
+`ActualizarDiagnostico` utiliza `diagnostico`, `tratamiento` y `presupuesto`.
+`ActualizarEstado` debe leer y bloquear la fila del servicio con `SELECT ...
+FOR UPDATE` dentro de una transacción, comparar la versión esperada y, si
+coincide, incrementar `version`, actualizar `estado` e insertar en el historial
+la versión resultante y los estados anterior y nuevo. Si falla cualquiera
+de las escrituras, debe revertir ambas. Por ahora, `version` se usa como
+contador de cambios de estado.
+
+### Aprovisionar el usuario y el secreto
+
+1. Usar una sesión administrativa autorizada con conectividad privada hacia
+   el endpoint directo de RDS, desde un equipo con acceso privado a la VPC
+   o desde un cliente de administración autorizado dentro de ella. Verificar
+   el certificado de RDS y su hostname con `sslmode=verify-full` y el bundle
+   de CA de RDS. Ejecutar primero el esquema con la identidad de migración.
+2. Con una identidad autorizada para administrar roles y otorgar privilegios
+   en `servitech`, ejecutar una vez `psql -X -v ON_ERROR_STOP=1 -f
+   sql/provision_servitech_app.sql`. El rol se crea con `NOLOGIN`, sin
+   `rds_iam`, con permisos de lectura y escritura acotados a las operaciones
+   previstas y sin privilegios de propietario ni de DDL persistente. Si el
+   script detecta `CREATE` efectivo heredado de `PUBLIC` en la base o el
+   esquema, el administrador debe revisar esos permisos antes de repetirlo.
+3. Generar la contraseña en un gestor seguro. Asignarla mediante el prompt
+   interactivo `\password servitech_app` de psql. Guardar la misma
+   credencial en Secrets Manager en el secreto dedicado descrito arriba.
+   Mantener la contraseña fuera de SQL, archivos y argumentos de comandos.
+   Habilitar el acceso con `ALTER ROLE servitech_app LOGIN;` una vez que el
+   secreto esté listo. Comprobar que la versión vigente del secreto coincide
+   con el rol SQL antes de habilitar el proxy.
+4. Para mantener los privilegios del nuevo usuario, Gordillo deberá retirar
+   el `CREATE TABLE IF NOT EXISTS` de ambas Lambda cuando migren al proxy.
+   Durante esta fase, las Lambda actuales continúan usando el camino MVP.
 
 ## Prueba de registro y consulta
 
