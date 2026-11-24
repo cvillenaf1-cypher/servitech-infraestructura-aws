@@ -226,10 +226,14 @@ después de medir el uso y la latencia de préstamo en el entorno real.
 
 En una instalación nueva, el rol de migraciones ejecuta `psql -X -v
 ON_ERROR_STOP=1 -f sql/schema.sql` sobre la base `servitech`. Este punto de
-entrada de psql crea la tabla base e incluye la migración. Si el MVP ya creó
+entrada de psql crea la tabla base e incluye las dos migraciones. Si el MVP ya creó
 `public.servicios`, ejecutar `psql -X -v ON_ERROR_STOP=1 -f
-sql/migrations/001_servicios_historial.sql`. La migración aplica sus cambios
-en una transacción y se puede volver a ejecutar sobre el mismo esquema.
+sql/migrations/001_servicios_historial.sql` si la fase 3 aún está pendiente,
+y luego `psql -X -v ON_ERROR_STOP=1 -f sql/migrations/002_servicio_outbox.sql`.
+Cada migración aplica sus cambios en una transacción y se puede volver a
+ejecutar sobre el mismo esquema. Si `servitech_app` ya existe, la identidad
+autorizada debe ejecutar `psql -X -v ON_ERROR_STOP=1 -f sql/grant_servicio_outbox.sql`
+después de la migración 002 para otorgar los permisos adicionales.
 Coordinar la ventana porque `ALTER TABLE` puede bloquear temporalmente el
 acceso y la creación de índices puede tardar según el volumen.
 
@@ -279,6 +283,92 @@ contador de cambios de estado.
 4. Para mantener los privilegios del nuevo usuario, Gordillo deberá retirar
    el `CREATE TABLE IF NOT EXISTS` de ambas Lambda cuando migren al proxy.
    Durante esta fase, las Lambda actuales continúan usando el camino MVP.
+
+## Outbox de EstadoActualizado
+
+La Página 3 enumera literalmente `eventId`, `servicioId`, `clienteSub`,
+`estado`, «versión» y «teléfono verificado del destinatario (E.164)».
+El contrato JSON usa `version` según el requisito de esta fase y
+`telefonoVerificado` como clave técnica para el teléfono, que el diagrama
+describe sin asignarle un nombre de campo.
+
+| Campo en el detalle JSON | Columna de `public.servicio_outbox` | Tipo JSON |
+| --- | --- | --- |
+| `eventId` | `event_id` | Cadena UUID generada por PostgreSQL |
+| `servicioId` | `servicio_id` | Entero |
+| `clienteSub` | `cliente_sub` | Cadena |
+| `estado` | `estado` | Cadena |
+| `version` | `version` | Entero |
+| `telefonoVerificado` | `telefono_verificado_e164` | Cadena E.164 |
+
+Plantilla JSON del detalle de `EstadoActualizado`. Los marcadores deben
+reemplazarse por valores de la fila persistida. Los dos marcadores numéricos
+se sustituyen por enteros JSON.
+
+```json
+{
+  "eventId": "<UUID registrado>",
+  "servicioId": "<ID entero del servicio>",
+  "clienteSub": "<sub del cliente>",
+  "estado": "<estado registrado>",
+  "version": "<versión entera registrada>",
+  "telefonoVerificado": "<teléfono realmente verificado en E.164>"
+}
+```
+
+### Gordillo · escritura y publicación
+
+1. En la transacción de `ActualizarEstado`, bloquear el servicio y comprobar
+   la versión esperada. Actualizar el estado y la versión, insertar el historial
+   e insertar el outbox con la misma pareja `(servicio_id, version)`. Construir
+   el detalle con el nuevo estado, el propietario y el número verificado de
+   la fuente autorizada. El SQL valida el formato E.164. Si faltan los datos
+   requeridos o falla alguna escritura, revertir la transacción completa.
+2. Tras el `COMMIT`, cualquier publicador inmediato debe usar el mismo
+   mecanismo de reserva que los reintentos. Usar `PutEvents` únicamente
+   después de confirmar también la transacción de reserva, con la sesión
+   PostgreSQL fuera de transacción.
+
+### Jhonatan · despacho y reintentos
+
+Reservar un lote pequeño en una transacción corta. `$1` es el tamaño
+positivo del lote y `$2` es una duración positiva de reserva, suficiente
+para el plazo de envío y confirmación del lote. Para publicación inmediata
+se puede agregar un filtro por `event_id` a la selección. La reserva consume
+un intento aunque el proceso termine antes del envío.
+
+```sql
+WITH pendientes AS (
+    SELECT event_id
+    FROM public.servicio_outbox
+    WHERE publicado_en IS NULL AND disponible_desde <= statement_timestamp()
+    ORDER BY disponible_desde, creado_en, event_id
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE public.servicio_outbox AS o
+SET intentos = o.intentos + 1,
+    disponible_desde = statement_timestamp() + $2::interval
+FROM pendientes
+WHERE o.event_id = pendientes.event_id
+RETURNING o.*;
+```
+
+- Confirmar la reserva y luego enviar. Revisar el resultado de cada entrada
+  de `PutEvents`: al aceptar una, fijar `publicado_en`; ante error, fijar
+  `disponible_desde` con la demora de reintento. Acotar la demora e incorporar
+  variación aleatoria para evitar reintentos simultáneos. En ambos casos
+  actualizar solo si coinciden `event_id`, el `intentos` devuelto por la
+  reserva y `publicado_en IS NULL`. Cero filas actualizadas indica que la
+  reserva ya no corresponde al trabajador.
+- Al vencer una reserva sin confirmar, la fila vuelve a estar disponible.
+  Si el envío fue aceptado y el trabajador cayó antes de marcarlo, puede
+  reenviarse. Reutilizar el mismo `eventId` en todos los intentos y deduplicar
+  efectos en los consumidores con ese identificador persistido. EventBridge
+  no garantiza entrega exactamente una vez.
+- El rol `servitech_app` puede leer el outbox, insertar el detalle y
+  actualizar solo los metadatos de despacho. El UUID, el detalle y la
+  fecha de creación quedan fuera de sus permisos de actualización.
 
 ## Prueba de registro y consulta
 

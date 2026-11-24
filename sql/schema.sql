@@ -9,3 +9,4 @@ CREATE TABLE IF NOT EXISTS public.servicios (
 );
 
 \ir migrations/001_servicios_historial.sql
+\ir migrations/002_servicio_outbox.sql
