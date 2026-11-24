@@ -12,12 +12,36 @@ resource "aws_security_group" "lambda" {
   }
 }
 
-# Las Lambdas pueden iniciar conexiones hacia otros recursos.
-resource "aws_vpc_security_group_egress_rule" "lambda_all" {
-  security_group_id = aws_security_group.lambda.id
+moved {
+  from = aws_vpc_security_group_egress_rule.lambda_all
+  to   = aws_vpc_security_group_egress_rule.lambda_to_rds
+}
 
-  cidr_ipv4   = "0.0.0.0/0"
-  ip_protocol = "-1"
+resource "aws_vpc_security_group_egress_rule" "lambda_to_rds" {
+  description                  = "PostgreSQL desde las Lambdas del MVP"
+  security_group_id            = aws_security_group.lambda.id
+  referenced_security_group_id = aws_security_group.rds.id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+
+  # Habilita la lectura del secreto antes de restringir la salida anterior.
+  depends_on = [aws_vpc_security_group_egress_rule.lambda_to_secrets]
+
+  # Si el cambio de tipo de destino exige reemplazo, conservar la regla vieja
+  # hasta crear la nueva. Ver la transición desde el MVP en el contrato de red.
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_egress_rule" "lambda_to_secrets" {
+  description                  = "HTTPS al endpoint privado de Secrets Manager"
+  security_group_id            = aws_security_group.lambda.id
+  referenced_security_group_id = aws_security_group.secrets_endpoint.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
 }
 
 # ============================================================
@@ -34,7 +58,7 @@ resource "aws_security_group" "rds" {
   }
 }
 
-# PostgreSQL solamente acepta conexiones desde las Lambdas.
+# Acceso directo del MVP; se conserva durante la transición a RDS Proxy.
 resource "aws_vpc_security_group_ingress_rule" "rds_from_lambda" {
   security_group_id = aws_security_group.rds.id
 
@@ -68,4 +92,42 @@ resource "aws_vpc_security_group_ingress_rule" "secrets_from_lambda" {
   from_port   = 443
   to_port     = 443
   ip_protocol = "tcp"
+}
+
+# Lambda 4: el responsable de ActualizarEstado asociará este SG al publicador.
+# IAM queda pendiente de su rol propio y del ARN del bus que defina el equipo de eventos.
+resource "aws_security_group" "lambda4_publisher" {
+  name        = "${local.name_prefix}-lambda4-publisher-sg"
+  description = "Publicador de cambios de estado hacia EventBridge"
+  vpc_id      = aws_vpc.main.id
+  egress      = []
+
+  lifecycle {
+    ignore_changes = [egress] # La salida la administra publisher_to_eventbridge.
+  }
+}
+
+resource "aws_security_group" "eventbridge_endpoint" {
+  name        = "${local.name_prefix}-eventbridge-endpoint-sg"
+  description = "Endpoint privado de EventBridge"
+  vpc_id      = aws_vpc.main.id
+  egress      = []
+}
+
+resource "aws_vpc_security_group_egress_rule" "publisher_to_eventbridge" {
+  description                  = "HTTPS desde Lambda 4 al endpoint de EventBridge"
+  security_group_id            = aws_security_group.lambda4_publisher.id
+  referenced_security_group_id = aws_security_group.eventbridge_endpoint.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
+}
+
+resource "aws_vpc_security_group_ingress_rule" "eventbridge_from_publisher" {
+  description                  = "HTTPS solo desde el SG publicador de Lambda 4"
+  security_group_id            = aws_security_group.eventbridge_endpoint.id
+  referenced_security_group_id = aws_security_group.lambda4_publisher.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
 }
