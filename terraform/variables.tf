@@ -37,3 +37,15 @@ variable "database_app_secret_kms_key_arn" {
     error_message = "Indica el ARN de una clave KMS o usa null para aws/secretsmanager."
   }
 }
+
+variable "lambda4_event_bus_arn" {
+  description = "ARN del bus EventBridge que integrara Jhonatan."
+  type        = string
+  default     = null
+}
+
+variable "lambda4_cognito_user_pool_arn" {
+  description = "ARN del User Pool de Cognito proporcionado por Joel."
+  type        = string
+  default     = null
+}
