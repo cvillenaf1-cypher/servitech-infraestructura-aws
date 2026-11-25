@@ -43,9 +43,3 @@ variable "lambda4_event_bus_arn" {
   type        = string
   default     = null
 }
-
-variable "lambda4_cognito_user_pool_arn" {
-  description = "ARN del User Pool de Cognito proporcionado por Joel."
-  type        = string
-  default     = null
-}

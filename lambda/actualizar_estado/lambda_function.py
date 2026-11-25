@@ -4,6 +4,11 @@ import re
 
 import boto3
 import psycopg2
+from botocore.config import Config
+
+
+class CognitoNoDisponible(RuntimeError):
+    """No se pudo completar la consulta del propietario de forma segura."""
 
 
 def response(status_code, body):
@@ -204,11 +209,24 @@ def obtener_actor_autenticado(event):
     if not isinstance(actor_sub, str) or not actor_sub.strip():
         raise ValueError("No se encontró un usuario autenticado.")
 
-    return actor_sub.strip()
+    return actor_sub
 
 
 
-def obtener_telefono_verificado(cliente_sub):
+def consultar_cognito(operacion, context, **parametros):
+    # Cada solicitud tiene hasta 1 s de conexión y 2 s de lectura, sin reintentos.
+    # Reservar margen para rollback antes del timeout de la Lambda (15 s).
+    if context is not None and context.get_remaining_time_in_millis() <= 4000:
+        raise CognitoNoDisponible("Tiempo insuficiente para consultar Cognito.")
+
+    try:
+        return operacion(**parametros)
+    except Exception:
+        # No exponer respuestas del SDK, teléfonos ni identificadores al cliente.
+        raise CognitoNoDisponible("No se pudo consultar Cognito.") from None
+
+
+def obtener_telefono_verificado(cliente_sub, context=None):
     pool_id = os.environ.get(
         "COGNITO_USER_POOL_ID", ""
     ).strip()
@@ -218,28 +236,44 @@ def obtener_telefono_verificado(cliente_sub):
             "Falta configurar Cognito."
         )
 
-    if (
-        not isinstance(cliente_sub, str)
-        or not re.fullmatch(
-            r"[0-9a-fA-F-]{36}", cliente_sub
-        )
-    ):
+    if not isinstance(cliente_sub, str) or not cliente_sub.strip():
         raise ValueError(
             "El cliente no tiene un identificador válido."
         )
 
-    cognito = boto3.client(
-        "cognito-idp",
-        region_name=os.environ["AWS_REGION"],
-    )
+    # sub es opaco: conservarlo exactamente y escapar su valor en el filtro.
+    filtro = "sub = " + json.dumps(cliente_sub, ensure_ascii=False)
+    if len(filtro) > 256:  # Límite del filtro de ListUsers, no formato de sub.
+        raise ValueError("El identificador excede el límite de consulta.")
 
-    resultado = cognito.list_users(
-        UserPoolId=pool_id,
-        Filter=f'sub = "{cliente_sub}"',
-        Limit=2,
-    )
+    try:
+        cognito = boto3.client(
+            "cognito-idp",
+            region_name=os.environ["AWS_REGION"],
+            config=Config(
+                connect_timeout=1,
+                read_timeout=2,
+                retries={"mode": "standard", "total_max_attempts": 1},
+            ),
+        )
+    except Exception:
+        raise CognitoNoDisponible("No se pudo iniciar la consulta Cognito.") from None
 
-    usuarios = resultado.get("Users", [])
+    parametros = {"UserPoolId": pool_id, "Filter": filtro, "Limit": 2}
+    usuarios = []
+    # ListUsers es eventualmente consistente; solo sirve para resolver Username.
+    # Recorrer páginas vacías sin aceptar un resultado parcial o ambiguo.
+    for _ in range(5):
+        resultado = consultar_cognito(cognito.list_users, context, **parametros)
+        usuarios.extend(resultado.get("Users", []))
+        if len(usuarios) > 1:
+            raise ValueError("La identidad del cliente es ambigua.")
+        token = resultado.get("PaginationToken")
+        if not token:
+            break
+        parametros["PaginationToken"] = token
+    else:
+        raise CognitoNoDisponible("No se pudo completar la búsqueda del cliente.")
 
     if len(usuarios) != 1:
         raise ValueError(
@@ -247,22 +281,38 @@ def obtener_telefono_verificado(cliente_sub):
         )
 
     usuario = usuarios[0]
-
-    if usuario.get("Enabled") is False:
-        raise ValueError(
-            "La cuenta del cliente está deshabilitada."
-        )
-
     atributos = {
         atributo["Name"]: atributo.get("Value")
         for atributo in usuario.get("Attributes", [])
     }
+    username = usuario.get("Username")
+    if (
+        atributos.get("sub") != cliente_sub
+        or not isinstance(username, str)
+        or not username
+    ):
+        raise ValueError("No se pudo comprobar la identidad del cliente.")
+
+    usuario_actual = consultar_cognito(
+        cognito.admin_get_user, context, UserPoolId=pool_id, Username=username
+    )
+    atributos = {
+        atributo["Name"]: atributo.get("Value")
+        for atributo in usuario_actual.get("UserAttributes", [])
+    }
+    if (
+        usuario_actual.get("Username") != username
+        or atributos.get("sub") != cliente_sub
+    ):
+        raise ValueError("No se pudo comprobar la identidad del cliente.")
+
+    if usuario_actual.get("Enabled") is not True:
+        raise ValueError("La cuenta del cliente no está habilitada.")
 
     telefono = atributos.get("phone_number")
 
     if (
-        atributos.get("sub") != cliente_sub
-        or atributos.get("phone_number_verified") != "true"
+        atributos.get("phone_number_verified") != "true"
         or not isinstance(telefono, str)
         or not re.fullmatch(
             r"\+[1-9][0-9]{1,14}", telefono
@@ -395,7 +445,7 @@ def lambda_handler(event, context):
                 )
 
             telefono = obtener_telefono_verificado(
-                cambio["cliente_sub"]
+                cambio["cliente_sub"], context
             )
 
             event_id = registrar_evento_outbox(
@@ -429,6 +479,15 @@ def lambda_handler(event, context):
             },
         )
 
+
+    except CognitoNoDisponible:
+        if connection is not None:
+            connection.rollback()
+
+        return response(
+            503,
+            {"message": "No se pudo verificar el teléfono del propietario."},
+        )
 
     except NotImplementedError:
         if connection is not None:

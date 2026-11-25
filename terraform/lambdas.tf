@@ -210,7 +210,7 @@ resource "aws_lambda_function" "actualizar_estado" {
       DB_NAME              = aws_db_instance.postgres.db_name
       DB_USER              = local.database_app_username
       EVENT_BUS_ARN        = var.lambda4_event_bus_arn == null ? "" : var.lambda4_event_bus_arn
-      COGNITO_USER_POOL_ID = var.lambda4_cognito_user_pool_arn == null ? "" : split("/", var.lambda4_cognito_user_pool_arn)[1]
+      COGNITO_USER_POOL_ID = aws_cognito_user_pool.servitech.id
     }
   }
 
@@ -228,7 +228,10 @@ resource "aws_lambda_function" "actualizar_estado" {
 
   depends_on = [
     aws_iam_role_policy_attachment.lambda4_vpc_access,
-    aws_iam_role_policy.lambda4_proxy_connect
+    aws_iam_role_policy.lambda4_proxy_connect,
+    aws_iam_role_policy.lambda4_cognito_lookup,
+    aws_vpc_security_group_ingress_rule.cognito_from_lambda4,
+    aws_vpc_security_group_egress_rule.lambda4_to_cognito
   ]
 }
 
@@ -346,9 +349,13 @@ resource "aws_iam_role_policy" "lambda4_eventbridge_publish" {
 }
 
 
-resource "aws_iam_role_policy" "lambda4_cognito_lookup" {
-  count = var.lambda4_cognito_user_pool_arn == null ? 0 : 1
+# Conserva la política si la entrada opcional anterior ya la había creado.
+moved {
+  from = aws_iam_role_policy.lambda4_cognito_lookup[0]
+  to   = aws_iam_role_policy.lambda4_cognito_lookup
+}
 
+resource "aws_iam_role_policy" "lambda4_cognito_lookup" {
   name = "${local.name_prefix}-lambda4-cognito-read"
   role = aws_iam_role.lambda4_exec.id
 
@@ -356,8 +363,13 @@ resource "aws_iam_role_policy" "lambda4_cognito_lookup" {
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = "cognito-idp:ListUsers"
-      Resource = var.lambda4_cognito_user_pool_arn
+      Action   = ["cognito-idp:ListUsers", "cognito-idp:AdminGetUser"]
+      Resource = aws_cognito_user_pool.servitech.arn
+      Condition = {
+        StringEquals = {
+          "aws:SourceVpce" = aws_vpc_endpoint.cognito_idp.id
+        }
+      }
     }]
   })
 }

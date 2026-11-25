@@ -71,10 +71,8 @@ desde el cliente hasta completar ese flujo.
 
 - Se conservan las cinco Lambda y el IAM del RDS Proxy en `identity.tf`.
   No se modifica API Gateway, frontend, CloudFront, WAF, Route 53 ni ACM.
-- `ActualizarEstado` conserva `lambda4_cognito_user_pool_arn` como entrada
-  pendiente. Los nuevos outputs no la conectan automáticamente: otra fase debe
-  enlazar el pool, su permiso de consulta y el endpoint privado `cognito-idp` con
-  DNS y SG. Hasta entonces sigue pendiente la lectura del teléfono verificado.
+- La conexión privada de `ActualizarEstado`, pendiente al terminar la fase 1,
+  se incorpora en la fase 2 descrita a continuación.
 - No asignar un dominio al User Pool: se reserva la compatibilidad con
   PrivateLink. El navegador usará el endpoint público de Cognito mediante SDK.
 - La configuración de identidad no implementa aún el autorizador REST ni las
@@ -98,6 +96,87 @@ desde el cliente hasta completar ese flujo.
 Referencias: [atributos y permisos de Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-attributes.html),
 [PrivateLink](https://docs.aws.amazon.com/cognito/latest/developerguide/vpc-interface-endpoints.html)
 y [configuración SMS](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-sms-settings.html).
+
+## Fase 2: consulta privada de Cognito desde ActualizarEstado
+
+`terraform/cognito_network.tf` declara un endpoint de interfaz `cognito-idp`
+en `aws_vpc.main`, con una interfaz en cada subred `private_app_a` y
+`private_app_b`. El DNS privado utiliza el DNS ya habilitado en la VPC; el SDK
+resuelve el endpoint regional hacia IP privadas sin configurar una URL especial.
+No se crean VPC, subredes, NAT ni Internet Gateway. La Página 3 exige el teléfono
+verificado del destinatario, pero no dibuja esta conexión Lambda 4–Cognito;
+el endpoint completa esa dependencia según el alcance autorizado de la fase 2.
+
+El SG exclusivo `cognito_endpoint` admite TCP 443 únicamente desde
+`lambda4_publisher`, actualmente asociado solo a `ActualizarEstado`. Se añade
+una regla de salida a ese destino sin alterar las reglas de EventBridge ni el
+SG `rds_proxy_client`. No asociar `lambda4_publisher` a otras funciones: ampliaría
+el acceso de red. El endpoint no necesita salida iniciada por él para responder
+a conexiones permitidas, porque los SG mantienen el estado de las conexiones.
+
+Se reutilizan el rol `lambda4_exec` y la política `lambda4_cognito_lookup`.
+Ambas políticas (IAM y endpoint) permiten exclusivamente `ListUsers` y
+`AdminGetUser` sobre `aws_cognito_user_pool.servitech.arn`; la del endpoint
+solo acepta ese rol y la de IAM exige `aws:SourceVpce` del nuevo endpoint.
+No se conceden operaciones de escritura o verificación de atributos.
+La cadena de dependencias es rol/pool → endpoint → política IAM → Lambda,
+sin dependencia inversa del rol hacia su política. Se conserva un bloque
+`moved` desde la instancia anterior `[0]` para evitar recrear una política
+ya administrada en el estado.
+
+`COGNITO_USER_POOL_ID` referencia directamente el pool. Se retira la variable
+`lambda4_cognito_user_pool_arn`; quienes la suministraran externamente deben
+retirarla de su configuración. No se han modificado backend, workspace o CI.
+El User Pool conserva ambas protecciones contra borrado y no tiene dominio.
+Esta conexión no convierte en privado el login SDK del navegador.
+
+La consulta toma `cliente_sub` de la fila del servicio, no del body ni del actor.
+`sub` se trata como texto opaco, sin convertirlo a UUID ni normalizarlo.
+`ListUsers` usa igualdad exacta y un valor escapado; recorre hasta cinco páginas
+y rechaza búsquedas incompletas o ambiguas. Solo resuelve el Username:
+`AdminGetUser` comprueba de nuevo Username y sub, exige `Enabled=true`,
+`phone_number_verified="true"` y teléfono E.164. La aplicación no establece
+ninguno de esos indicadores ni sustituye la verificación real.
+
+Un propietario ausente, identidad incoherente, cuenta deshabilitada o teléfono
+sin verificar provoca HTTP 409 y rollback. Los fallos de consulta, búsqueda
+incompleta o tiempo insuficiente provocan HTTP 503 y rollback. No se inserta
+el outbox ni se publica el evento si falla esta comprobación; los cambios de
+estado e historial ejecutados antes se revierten. Se conserva el procesamiento
+existente del outbox y EventBridge. El SDK usa 1 s de conexión, 2 s de lectura,
+un solo intento y comprueba que resten más de 4 s antes de cada llamada.
+Esto reduce la espera dentro de la transacción, pero no garantiza un plazo
+total ante DNS lento, bloqueos SQL o un timeout forzado del runtime.
+
+Las pruebas de `tests/test_cognito_estado.py` usan respuestas ficticias locales
+para verificar éxito, paginación, identidad, teléfono, fallos y rollback; no
+crean usuarios ni marcan teléfonos reales como verificados. Se ejecutan con
+`python -B -m unittest discover -s tests -v`. Los paquetes se regeneran con
+`scripts/build_lambdas.ps1` y permanecen ignorados en `build/`.
+
+Pendientes antes del despliegue y de la integración completa:
+
+- Verificar región efectiva, cuenta, estado compartido y ausencia de otro
+  endpoint `cognito-idp` con DNS privado en la misma VPC. Confirmar disponibilidad
+  del servicio en ambas AZ, IP libres, cuotas y reglas NACL/DNS efectivas.
+- Verificar permisos del ejecutor Terraform para gestionar endpoint, SG/reglas,
+  política inline del rol y configuración de Lambda, incluido `iam:PassRole`.
+  Las validaciones locales no comprueban permisos AWS ni conectividad real.
+- Aprovisionar propietarios reales, enlazar su sub al servicio y completar el
+  flujo real de verificación telefónica. `ListUsers` tiene consistencia eventual:
+  un usuario recién creado puede no aparecer todavía y la operación se rechaza.
+- Probar en AWS, tras autorización de despliegue, DNS privado, acceso desde
+  Lambda 4, denegación desde otros roles y rollback con PostgreSQL real.
+  Considerar el coste de las dos interfaces PrivateLink y que `AdminGetUser`
+  contribuye al cómputo de usuarios activos mensuales de Cognito.
+- Mantener pendientes API/autorizador y autorización por sede, la configuración
+  del bus y los contratos/reintentos del outbox a cargo de sus responsables,
+  y la destrucción controlada de DEV antes de finalizar el PR. Esta fase no
+  modifica esos componentes ni la retención de logs (requisito: 14 días).
+
+Referencias: [PrivateLink y políticas de Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/vpc-interface-endpoints.html),
+[ListUsers y consistencia eventual](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_ListUsers.html),
+[AdminGetUser](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AdminGetUser.html).
 
 ## Arquitectura
 

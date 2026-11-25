@@ -69,7 +69,7 @@ output "database_instance_arn" {
 }
 
 output "cognito_user_pool_id" {
-  description = "ID del User Pool para el SDK y la futura integración de ActualizarEstado."
+  description = "ID del User Pool para el SDK y ActualizarEstado."
   value       = aws_cognito_user_pool.servitech.id
 }
 
