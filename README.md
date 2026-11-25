@@ -4,6 +4,101 @@ ServiTech permite registrar y consultar servicios técnicos. Terraform administr
 la infraestructura del MVP. La demostración requiere un INSERT real en PostgreSQL
 y un SELECT del mismo registro por el ID devuelto; una respuesta simulada no basta.
 
+## Cognito: primera fase de autenticación
+
+La referencia técnica es exclusivamente la Página 3 del diagrama oficial,
+que no forma parte del repositorio. Esta fase declara Cognito en
+`terraform/cognito.tf`. `us-east-2` es la región predeterminada del código;
+la región efectiva de despliegue todavía debe verificarse, porque los workflows
+inyectan `TF_VAR_aws_region` desde el secreto `AWS_REGION` de GitHub.
+El stage sigue siendo `dev`; no se modifica el backend ni el workspace.
+La infraestructura declarada no implica que esté desplegada.
+
+| Decisión | Configuración |
+| --- | --- |
+| User Pool | `${local.name_prefix}-usuarios`, protección de borrado activa y `prevent_destroy` para conservar los identificadores `sub`. |
+| Plan de Cognito | `LITE`, suficiente para los flujos configurados. |
+| Login | Username administrativo sin distinción de mayúsculas; SDK/SRP, sin dominio de User Pool ni OAuth. Email y teléfono son datos de contacto, no alias de login. |
+| Alta y recuperación | Solo administración autorizada mediante IAM. El grupo de aplicación Administrador no otorga permisos IAM para gestionar Cognito. |
+| App Client | Público, sin secreto; `ALLOW_USER_SRP_AUTH` y `ALLOW_REFRESH_TOKEN_AUTH`. |
+| Contraseña | Mínimo 12 caracteres, mayúscula, minúscula, número y símbolo; contraseña temporal válida 3 días. |
+| MFA | TOTP opcional, sin SMS. La pertenencia a un grupo no obliga por sí sola a usar MFA. |
+| Tokens | ID y access: 15 minutos; refresh: 1 día; sesión de desafío: 3 minutos. |
+| Seguridad del cliente | Errores de existencia de usuario suprimidos y revocación habilitada. Rotación de refresh deshabilitada para conservar `REFRESH_TOKEN_AUTH`. |
+| Lectura de atributos | `sub`, `name`, `email`, `email_verified`, `phone_number`, `phone_number_verified`. |
+| Escritura de atributos | Solo `name`. Contacto, indicadores de verificación y futuros atributos de autorización no son editables desde este cliente. |
+| Grupos | `Cliente`, `Técnico` y `Administrador`, sin roles IAM asociados ni acceso global implícito. |
+
+Los atributos estándar conservan su esquema de Cognito; email, nombre y teléfono
+son opcionales. No se crean usuarios, contraseñas, teléfonos ni membresías en
+Terraform. La administración deberá asignar los grupos expresamente y entregar
+las credenciales iniciales por un canal seguro. Si utiliza invitaciones, deberá
+elegir entrega EMAIL con un correo real o suprimir el envío y coordinar la entrega;
+no debe depender de SMS mientras ese canal no esté configurado.
+El futuro cliente SDK debe atender `NEW_PASSWORD_REQUIRED`, enrolamiento/desafíos
+TOTP cuando corresponda, renovación y cierre de sesión. Revocar un refresh token
+no garantiza que un consumidor que solo valida la firma de un JWT deje de aceptar
+inmediatamente el ID/access token ya emitido; se debe considerar su expiración.
+
+Outputs públicos de integración: `cognito_user_pool_id`, `cognito_user_pool_arn`
+y `cognito_app_client_id`. No contienen secretos. `sub` identifica al usuario
+de forma estable dentro del pool; no debe sustituirse por username, email o
+teléfono. `cognito:groups` lo emite Cognito a partir de las membresías administradas,
+no es un atributo editable del App Client. Se usa la grafía `Técnico`, ya admitida
+por las Lambda existentes.
+
+### Propuesta pendiente de sede y verificación telefónica
+
+Por decisión del equipo, **no se crea todavía `custom:sede_id`**. La propuesta
+es un String opcional, con valor mutable por administración IAM autorizada y
+lectura para el App Client, excluido de `write_attributes`. Antes de incorporarlo
+se deben definir catálogo, formato, límite de longitud, soporte multisede y
+alcance del Administrador. Un atributo ausente no autoriza acceso entre sedes.
+El alta del atributo debe revisarse porque Cognito no permite eliminarlo después.
+La autorización por propietario, rol y sede se implementará en una fase posterior.
+
+El teléfono debe pertenecer al cliente propietario y tener formato E.164.
+Esta fase no configura SMS ni verificación automática, y no establece
+`phone_number_verified=true`. Para habilitar la verificación real faltan el canal
+de entrega, rol de servicio y permisos, región de mensajería, condiciones del
+sandbox, destinos/origen autorizados y flujo SDK de envío y comprobación del código.
+Verificar un destino del sandbox o confirmar una cuenta no sustituye verificar
+el atributo del usuario. Debe definirse también cómo verificar un número nuevo
+antes de sustituir el teléfono vigente. Mantener `phone_number` sin escritura
+desde el cliente hasta completar ese flujo.
+
+### Límites de integración de esta fase
+
+- Se conservan las cinco Lambda y el IAM del RDS Proxy en `identity.tf`.
+  No se modifica API Gateway, frontend, CloudFront, WAF, Route 53 ni ACM.
+- `ActualizarEstado` conserva `lambda4_cognito_user_pool_arn` como entrada
+  pendiente. Los nuevos outputs no la conectan automáticamente: otra fase debe
+  enlazar el pool, su permiso de consulta y el endpoint privado `cognito-idp` con
+  DNS y SG. Hasta entonces sigue pendiente la lectura del teléfono verificado.
+- No asignar un dominio al User Pool: se reserva la compatibilidad con
+  PrivateLink. El navegador usará el endpoint público de Cognito mediante SDK.
+- La configuración de identidad no implementa aún el autorizador REST ni las
+  comprobaciones de sede. Tampoco implementa las responsabilidades de Jhonatan.
+- La retención requerida de logs es **14 días**. El monitoreo heredado de las
+  secciones siguientes todavía declara 7 días para dos Lambda; su corrección y
+  la cobertura restante se coordinan con Jhonatan. Cognito no añade grupos de
+  logs ni modifica retenciones en esta fase.
+- Antes de un despliegue futuro, reconciliar el workspace compartido con
+  `TF_WORKSPACE=default` de CI y verificar recursos existentes para no duplicarlos.
+  No cambiar el estado para resolver esa diferencia. El resto de esta guía
+  contiene procedimientos heredados del MVP, no pasos ejecutados en esta fase.
+- Se conservan `prevent_destroy = true` y `deletion_protection = "ACTIVE"`.
+  Cuando el User Pool exista en el estado, `destroy-dev.yml` no podrá completar
+  su plan de destrucción por `prevent_destroy`; Cognito también impedirá borrar
+  el pool mientras su protección esté activa. Confirmar `DESTROY` no desactiva
+  estas protecciones. El procedimiento de destrucción controlada de DEV queda
+  pendiente para una fase independiente, antes de finalizar el Pull Request,
+  manteniendo ambas protecciones en producción.
+
+Referencias: [atributos y permisos de Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-attributes.html),
+[PrivateLink](https://docs.aws.amazon.com/cognito/latest/developerguide/vpc-interface-endpoints.html)
+y [configuración SMS](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-sms-settings.html).
+
 ## Arquitectura
 
 ```text
@@ -48,7 +143,7 @@ Lambdas acceden a PostgreSQL dentro de la VPC; la base de datos no es pública.
 | --- | --- |
 | Perfil AWS | `servitech` |
 | Cuenta AWS | `694188424284` |
-| Región de los recursos | `us-east-1` |
+| Región predeterminada del código | `us-east-2`; despliegue efectivo pendiente de verificar |
 | Región de IAM Identity Center | `us-east-2` |
 | Workspace compartido | `dev` |
 | Rama de monitoreo | `feat/monitoring-mvp` |
@@ -61,7 +156,8 @@ aws sts get-caller-identity --profile servitech --query Account --output text
 ```
 
 La cuenta debe ser `694188424284`. IAM Identity Center utiliza `us-east-2` para
-SSO; el despliegue permanece en `us-east-1`.
+SSO; la región principal acordada y predeterminada del código es `us-east-2`.
+Esto no confirma la región efectiva de los recursos desplegados.
 
 ## Preparación y validación
 
@@ -135,7 +231,7 @@ terraform output -raw environment
 | `api_url` | URL base real de API Gateway, incluido `/dev` |
 | `database_endpoint` | Host y puerto de PostgreSQL, accesibles desde la VPC |
 | `frontend_bucket` | Nombre del bucket S3 privado |
-| `aws_region` | Región configurada; por defecto `us-east-1` |
+| `aws_region` | Región configurada; por defecto `us-east-2` |
 | `environment` | Workspace actual; debe ser `dev` |
 
 Estos outputs no incluyen contraseñas, tokens, credenciales ni el ARN del secreto.
@@ -469,7 +565,7 @@ sustituye esta comprobación.
 
 ## CloudWatch Logs
 
-En la consola AWS, seleccionar la cuenta del proyecto y `us-east-1`, abrir
+En la consola AWS, seleccionar la cuenta del proyecto y `us-east-2`, abrir
 CloudWatch → Logs → Log groups y buscar, con los nombres predeterminados actuales:
 
 - `/aws/lambda/servitech-dev-registrar-servicio`
@@ -479,13 +575,13 @@ Cada grupo tiene retención de 7 días. Después de la prueba, revisar los strea
 las marcas de tiempo de ambas invocaciones. También se pueden seguir desde CLI:
 
 ```powershell
-aws logs tail /aws/lambda/servitech-dev-registrar-servicio --since 10m --follow --profile servitech --region us-east-1
+aws logs tail /aws/lambda/servitech-dev-registrar-servicio --since 10m --follow --profile servitech --region us-east-2
 ```
 
 Terminar con `Ctrl+C` y repetir para la consulta:
 
 ```powershell
-aws logs tail /aws/lambda/servitech-dev-consultar-servicio --since 10m --follow --profile servitech --region us-east-1
+aws logs tail /aws/lambda/servitech-dev-consultar-servicio --since 10m --follow --profile servitech --region us-east-2
 ```
 
 Las Lambdas actuales registran mensajes genéricos de error. No agregar al log

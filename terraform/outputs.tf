@@ -67,3 +67,18 @@ output "database_instance_arn" {
   description = "ARN de la instancia RDS PostgreSQL."
   value       = aws_db_instance.postgres.arn
 }
+
+output "cognito_user_pool_id" {
+  description = "ID del User Pool para el SDK y la futura integración de ActualizarEstado."
+  value       = aws_cognito_user_pool.servitech.id
+}
+
+output "cognito_user_pool_arn" {
+  description = "ARN del User Pool para el futuro autorizador REST y permisos de lectura Cognito."
+  value       = aws_cognito_user_pool.servitech.arn
+}
+
+output "cognito_app_client_id" {
+  description = "ID público del App Client del portal; no tiene secreto."
+  value       = aws_cognito_user_pool_client.portal.id
+}
