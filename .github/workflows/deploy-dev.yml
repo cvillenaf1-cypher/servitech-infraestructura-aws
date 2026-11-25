@@ -30,33 +30,8 @@ jobs:
           python-version: "3.12"
 
       - name: Construir paquetes Lambda
-        run: |
-          rm -rf build
-          mkdir -p build/pkg_registrar
-          mkdir -p build/pkg_consultar
-
-          pip install \
-            -r lambda/requirements.txt \
-            --target build/pkg_registrar
-
-          cp lambda/registrar_servicio/lambda_function.py \
-            build/pkg_registrar/lambda_function.py
-
-          cp -r build/pkg_registrar/. build/pkg_consultar/
-
-          cp lambda/consultar_servicio/lambda_function.py \
-            build/pkg_consultar/lambda_function.py
-
-          cd build/pkg_registrar
-          zip -r ../registrar_servicio.zip .
-          cd ../..
-
-          cd build/pkg_consultar
-          zip -r ../consultar_servicio.zip .
-          cd ../..
-
-          echo "Paquetes Lambda creados:"
-          ls -lh build/*.zip
+        shell: bash
+        run: bash scripts/build_lambdas_ci.sh
 
       - name: Configurar Terraform
         uses: hashicorp/setup-terraform@v4

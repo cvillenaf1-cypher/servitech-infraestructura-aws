@@ -48,6 +48,7 @@ credentials.json
 .env
 .env.*
 *.pem
+!lambda/certs/amazon-trust-roots.pem
 *.key
 *.p12
 *.pfx
@@ -73,3 +74,6 @@ Desktop.ini
 
 # Lambda build artifacts
 build/
+
+__pycache__/
+*.py[cod]

@@ -29,8 +29,17 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "No se pudieron instalar las dependencias Linux para Python 3.12."
     }
+    $certificatePath = Join-Path $repoRoot "lambda\certs\amazon-trust-roots.pem"
 
-    foreach ($functionName in @("registrar_servicio", "consultar_servicio")) {
+    if (-not (Test-Path -LiteralPath $certificatePath)) {
+        throw "No se encontro el archivo de certificados de Amazon."
+    }
+
+    Copy-Item -LiteralPath $certificatePath `
+        -Destination (Join-Path $packageDirectory "amazon-trust-roots.pem") `
+        -Force
+
+foreach ($functionName in @("registrar_servicio", "consultar_servicio", "actualizar_diagnostico", "actualizar_estado", "gestionar_evidencias")) {
         $source = Join-Path $repoRoot "lambda\$functionName\lambda_function.py"
         Copy-Item -LiteralPath $source -Destination (Join-Path $packageDirectory "lambda_function.py") -Force
         $zipPath = Join-Path $buildDirectory "$functionName.zip"

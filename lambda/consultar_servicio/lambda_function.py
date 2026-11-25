@@ -45,54 +45,34 @@ def get_service_id(event):
     return service_id
 
 
-def get_database_credentials(secret_arn):
-    client = boto3.client("secretsmanager")
-    secret = client.get_secret_value(SecretId=secret_arn)
-    credentials = json.loads(secret["SecretString"])
-
-    if not isinstance(credentials, dict):
-        raise ValueError("Formato de credenciales inválido.")
-
-    for field in ("username", "password"):
-        value = credentials.get(field)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("Credenciales incompletas.")
-
-    return credentials
 
 
 def get_connection():
-    config = {}
-    for name in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_SECRET_ARN"):
-        value = os.environ[name]
-        if not value.strip():
-            raise ValueError("Configuración de base de datos incompleta.")
-        config[name] = value
+    host = os.environ["DB_HOST"]
+    port = int(os.environ["DB_PORT"])
+    dbname = os.environ["DB_NAME"]
+    username = os.environ["DB_USER"]
+    region = os.environ["AWS_REGION"]
 
-    credentials = get_database_credentials(config["DB_SECRET_ARN"])
+    rds_client = boto3.client("rds", region_name=region)
+
+    token = rds_client.generate_db_auth_token(
+        DBHostname=host,
+        Port=port,
+        DBUsername=username,
+        Region=region,
+    )
+
     return psycopg2.connect(
-        host=config["DB_HOST"],
-        port=int(config["DB_PORT"]),
-        dbname=config["DB_NAME"],
-        user=credentials["username"],
-        password=credentials["password"],
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=username,
+        password=token,
+        sslmode="verify-full",
+        sslrootcert="/var/task/amazon-trust-roots.pem",
         connect_timeout=5,
     )
-
-
-def ensure_schema(cursor):
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS servicios (
-            id SERIAL PRIMARY KEY,
-            cliente VARCHAR(150) NOT NULL,
-            equipo VARCHAR(150) NOT NULL,
-            descripcion TEXT NOT NULL,
-            fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-    )
-
 
 def lambda_handler(event, context):
     try:
@@ -100,11 +80,20 @@ def lambda_handler(event, context):
     except ValueError as error:
         return response(400, {"message": str(error)})
 
+    try:
+        cliente_sub = event["requestContext"]["authorizer"]["claims"]["sub"]
+    except (KeyError, TypeError):
+        return response(401, {"message": "Usuario no autenticado."})
+
+    if not isinstance(cliente_sub, str) or not cliente_sub.strip():
+        return response(401, {"message": "Usuario no autenticado."})
+
+    cliente_sub = cliente_sub.strip()
+
     connection = None
     try:
         connection = get_connection()
         with connection.cursor() as cursor:
-            ensure_schema(cursor)
             cursor.execute(
                 """
                 SELECT
@@ -113,10 +102,10 @@ def lambda_handler(event, context):
                     equipo,
                     descripcion,
                     fecha_registro
-                FROM servicios
-                WHERE id = %s;
+                FROM public.servicios
+                WHERE id = %s AND cliente_sub = %s;
                 """,
-                (service_id,),
+                (service_id, cliente_sub),
             )
             service = cursor.fetchone()
 
