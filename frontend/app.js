@@ -1,7 +1,7 @@
 "use strict";
 
-// Reemplazar por la URL HTTPS real de API Gateway, incluido el stage /dev.
-const API_URL = "API_URL_PENDIENTE";
+// Mismo origen: CloudFront retira /api y añade el stage dev al llegar al origen.
+const API_URL = "/api";
 const REQUEST_TIMEOUT_MS = 20000;
 
 const registerForm = document.getElementById("register-form");
@@ -14,11 +14,11 @@ const registerStatus = document.getElementById("register-status");
 const lookupStatus = document.getElementById("lookup-status");
 const serviceIdInput = document.getElementById("servicio-id");
 const serviceResult = document.getElementById("service-result");
-const registrationInputs = ["cliente", "equipo", "descripcion"].map((id) => document.getElementById(id));
+const registrationInputs = ["cliente", "sede-id", "equipo", "descripcion"].map((id) => document.getElementById(id));
 
 function configuredApiUrl() {
   try {
-    const url = new URL(API_URL);
+    const url = new URL(API_URL, window.location.origin);
     if (url.protocol !== "https:" || url.search || url.hash || url.username || url.password) return null;
     return url.href.replace(/\/+$/u, "");
   } catch {
@@ -27,7 +27,23 @@ function configuredApiUrl() {
 }
 
 const apiBase = configuredApiUrl();
-document.getElementById("api-notice").hidden = Boolean(apiBase);
+document.getElementById("api-notice").hidden = Boolean(apiBase && window.ServitechAuth?.configured);
+
+function syncSession() {
+  const active = Boolean(window.ServitechAuth?.isSignedIn());
+  registerFields.disabled = !active;
+  lookupFields.disabled = !active;
+  if (!active) {
+    serviceResult.hidden = true;
+    serviceResult.querySelectorAll("dd").forEach((element) => { element.textContent = ""; });
+    registerForm.reset();
+    lookupForm.reset();
+    registerStatus.textContent = "";
+    lookupStatus.textContent = "";
+  }
+}
+window.addEventListener("servitech-auth-change", syncSession);
+syncSession();
 
 function showStatus(element, message, state = "error") {
   element.textContent = message;
@@ -41,7 +57,7 @@ function requireApi(status) {
 }
 
 function setLoading(form, fields, button, loading, idleText, loadingText) {
-  fields.disabled = loading;
+  fields.disabled = loading || !window.ServitechAuth?.isSignedIn();
   form.setAttribute("aria-busy", String(loading));
   button.textContent = loading ? loadingText : idleText;
 }
@@ -51,16 +67,24 @@ function validId(value) {
 }
 
 async function request(path, options = {}) {
+  const auth = window.ServitechAuth;
+  if (!auth) throw Object.assign(new Error("Inicia sesión para continuar."), { code: "AUTH_REQUIRED" });
+  const token = await auth.getToken();
+  const epoch = auth.epoch();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     const response = await fetch(`${apiBase}${path}`, {
       ...options,
-      headers: { Accept: "application/json", ...options.headers },
+      headers: { Accept: "application/json", ...options.headers, Authorization: token },
+      cache: "no-store",
+      credentials: "omit",
       signal: controller.signal,
     });
     // API Gateway entrega el body JSON directamente, sin envolverlo en statusCode/body.
     const body = await response.json().catch(() => null);
+    if (epoch !== auth.epoch()) throw Object.assign(new Error("La sesión cambió."), { code: "AUTH_REQUIRED" });
+    if (response.status === 401) throw Object.assign(new Error("La sesión fue rechazada. Vuelve a iniciar sesión."), { code: "AUTH_REQUIRED" });
     return { status: response.status, body };
   } finally {
     clearTimeout(timeout);
@@ -109,6 +133,10 @@ registerForm.addEventListener("submit", async (event) => {
       showStatus(registerStatus, `No se pudo confirmar el registro (HTTP ${status}). Consulta con el equipo antes de repetir el envío.`);
     }
   } catch (error) {
+    if (error.code === "AUTH_REQUIRED") {
+      showStatus(registerStatus, error.message);
+      return;
+    }
     const reason = error.name === "AbortError" ? "La API tardó demasiado en responder." : "No se pudo conectar con la API.";
     showStatus(registerStatus, `${reason} No se pudo confirmar el registro; verifica con el equipo si se guardó antes de repetir el envío.`);
   } finally {
@@ -151,6 +179,10 @@ lookupForm.addEventListener("submit", async (event) => {
       showStatus(lookupStatus, `No se pudo consultar el servicio (HTTP ${status}). Inténtalo de nuevo más tarde.`);
     }
   } catch (error) {
+    if (error.code === "AUTH_REQUIRED") {
+      showStatus(lookupStatus, error.message);
+      return;
+    }
     showStatus(lookupStatus, error.name === "AbortError" ? "La API tardó demasiado en responder. Inténtalo de nuevo." : "No se pudo conectar con la API. Revisa tu conexión o consulta con el equipo.");
   } finally {
     setLoading(lookupForm, lookupFields, lookupButton, false, "Consultar", "Consultando…");

@@ -105,9 +105,24 @@ explícitas en `tests/integration/check_authz_postgres.py`, empaquetado mediante
 en la raíz de los cinco ZIP y limpian solo sus directorios temporales.
 No ejecutar ambos simultáneamente. ZIP, results.xml e informes no se incluyen en Git.
 
+El portal inicia sesión por SRP, admite contraseña temporal y TOTP ya enrolado,
+y envía el ID token a `/api/*` en el mismo origen. Los tokens solo viven en memoria;
+recargar exige iniciar sesión. El alta, recuperación y enrolamiento MFA siguen
+siendo administrativos. SDK `amazon-cognito-identity-js` 6.3.22 vendorizado desde
+su paquete oficial npm, con integridad SHA-512 verificada y licencias incluidas.
+
+CloudFront conserva S3 privado/OAC y añade API Gateway sin caché, reenviando
+`Authorization` sin el Host del visitante. `/api/servicios` llega a `/dev/servicios`.
+`frontend_domain = null` conserva HTTPS con el dominio de CloudFront. Para usar
+dominio propio, configurar `frontend_domain` con `name` (FQDN real) y `zone_id`
+(zona pública existente y delegada): Terraform valida ACM en `us-east-1` por DNS
+y crea alias A/AAAA. No se registra un dominio ni se crea otra zona. Si ya existen
+certificado o registros equivalentes, coordinar su importación antes de aplicar.
+El bucket frontend tiene versionado habilitado, recuperado del PR #1 de Checkov.
+
 Pendientes de despliegue: aplicar las migraciones con autorización; cargar sedes,
-usuarios y asignaciones reales; implementar login SDK y envío del ID token en el
-frontend; comprobar región, permisos AWS, conectividad, CORS y eventos reales.
+usuarios y asignaciones reales; definir dominio/zona si se requieren; comprobar
+login, región, permisos AWS, conectividad, CORS y eventos reales.
 El flujo real de verificación telefónica/SMS sigue pendiente; no se simula.
 Las protecciones `prevent_destroy` y `deletion_protection=ACTIVE` bloquean
 `destroy-dev.yml`: el procedimiento controlado de DEV se resolverá por separado.
@@ -126,8 +141,9 @@ Navegador ──HTTPS──> CloudFront ──> S3 privado (HTML, CSS y JavaScri
                                                 └── CloudWatch Logs (7 días)
 ```
 
-El JavaScript servido por CloudFront llama directamente a API Gateway. Las
-Lambdas acceden a PostgreSQL dentro de la VPC; la base de datos no es pública.
+El esquema anterior resume el MVP inicial. Ahora el navegador llama a `/api/*`
+en CloudFront, que reenvía a API Gateway `/dev`. Las Lambda de datos acceden
+a PostgreSQL dentro de la VPC; la base de datos no es pública.
 
 ## Estado y dependencias de integración
 
@@ -136,9 +152,8 @@ Lambdas acceden a PostgreSQL dentro de la VPC; la base de datos no es pública.
 - La inspección inicial detectó que faltan `build/registrar_servicio.zip` y
   `build/consultar_servicio.zip`. Sin ellos, `terraform validate` falla en
   `terraform/lambdas.tf`, en las llamadas a `filebase64sha256`.
-- `frontend/app.js` contiene `API_URL_PENDIENTE`. El responsable del frontend debe
-  integrar la URL real del output `api_url`, incluido `/dev`, y coordinar su
-  publicación. Hasta entonces no se puede completar la prueba desde navegador.
+- Terraform publica `config.js` con los IDs públicos de Cognito. El frontend
+  accede mediante `frontend_api_url`; no contiene secretos ni una URL API manual.
 - Los grupos de logs y los outputs de esta rama deben incluirse en un despliegue
   coordinado. Si los grupos ya existen en AWS y no están en el estado compartido,
   el equipo debe coordinar su importación antes de aplicar; no borrarlos para
@@ -578,11 +593,11 @@ revisar junto al responsable de PostgreSQL el registro del ID creado en la tabla
 
 Con la URL real de API integrada en el frontend y publicada:
 
-1. Abrir `frontend_url` y las herramientas del desarrollador (Consola y Red).
-2. Registrar un servicio con el formulario y guardar el ID devuelto.
+1. Abrir `frontend_url`, iniciar sesión y abrir las herramientas del desarrollador.
+2. Registrar un servicio en una sede activa y guardar el ID devuelto.
 3. Consultar ese ID y comprobar que los datos coincidan.
-4. Verificar que el preflight `OPTIONS` y las solicitudes POST/GET funcionen
-   entre el origen CloudFront y API Gateway, sin errores de CORS en la consola.
+4. Verificar POST/GET por `/api/*` con `Authorization`, sin caché de respuestas
+   privadas; para evidencias comprobar el CORS de S3 desde el dominio del portal.
 
 PowerShell no aplica las restricciones CORS del navegador: aprobar el script no
 sustituye esta comprobación.

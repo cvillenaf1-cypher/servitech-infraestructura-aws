@@ -43,3 +43,20 @@ variable "lambda4_event_bus_arn" {
   type        = string
   default     = null
 }
+
+variable "frontend_domain" {
+  description = "Dominio del portal y ID de una zona pública Route 53 existente. null conserva el dominio HTTPS de CloudFront."
+  type = object({
+    name    = string
+    zone_id = string
+  })
+  default = null
+
+  validation {
+    condition = var.frontend_domain == null ? true : (
+      can(regex("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$", var.frontend_domain.name)) &&
+      can(regex("^Z[A-Z0-9]+$", var.frontend_domain.zone_id))
+    )
+    error_message = "Indica un FQDN en minúsculas sin protocolo ni punto final y el ID de la zona Route 53, o null."
+  }
+}

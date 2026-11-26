@@ -1,6 +1,11 @@
 output "frontend_url" {
   description = "URL HTTPS del frontend servido por CloudFront."
-  value       = "https://${aws_cloudfront_distribution.frontend.domain_name}"
+  value       = local.frontend_url
+}
+
+output "frontend_api_url" {
+  description = "API del portal a través de CloudFront, con el mismo origen."
+  value       = "${local.frontend_url}/api"
 }
 
 output "api_url" {
