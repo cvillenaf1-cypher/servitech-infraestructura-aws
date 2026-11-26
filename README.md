@@ -120,6 +120,14 @@ y crea alias A/AAAA. No se registra un dominio ni se crea otra zona. Si ya exist
 certificado o registros equivalentes, coordinar su importación antes de aplicar.
 El bucket frontend tiene versionado habilitado, recuperado del PR #1 de Checkov.
 
+WAF protege CloudFront (`CLOUDFRONT`, `us-east-1`) y la API (`REGIONAL`, stage
+`dev`). Ambas ACL aplican `AWSManagedRulesCommonRuleSet` sin excepciones; esta
+política base es una decisión técnica, no una lista de reglas del diagrama.
+El grupo bloquea cuerpos mayores de 8 KiB; las evidencias siguen subiendo
+directamente a S3. Validar tráfico legítimo antes de producción. Se habilitan
+métricas sin muestrear solicitudes con JWT; los logs y alarmas se coordinarán
+con Jhonatan, manteniendo la retención acordada de 14 días cuando se incorporen.
+
 Pendientes de despliegue: aplicar las migraciones con autorización; cargar sedes,
 usuarios y asignaciones reales; definir dominio/zona si se requieren; comprobar
 login, región, permisos AWS, conectividad, CORS y eventos reales.
