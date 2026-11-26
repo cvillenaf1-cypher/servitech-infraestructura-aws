@@ -50,6 +50,10 @@ data "aws_cloudfront_origin_request_policy" "api" {
   name = "Managed-AllViewerExceptHostHeader"
 }
 
+data "aws_cloudfront_response_headers_policy" "security" {
+  name = "Managed-SecurityHeadersPolicy"
+}
+
 resource "aws_cloudfront_function" "api_path" {
   name    = "${local.name_prefix}-api-path"
   runtime = "cloudfront-js-2.0"
@@ -86,14 +90,15 @@ resource "aws_cloudfront_distribution" "frontend" {
   }
 
   ordered_cache_behavior {
-    path_pattern             = "/api/*"
-    target_origin_id         = "servitech-api"
-    viewer_protocol_policy   = "https-only"
-    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods           = ["GET", "HEAD"]
-    cache_policy_id          = data.aws_cloudfront_cache_policy.api.id
-    origin_request_policy_id = data.aws_cloudfront_origin_request_policy.api.id
-    compress                 = true
+    path_pattern               = "/api/*"
+    target_origin_id           = "servitech-api"
+    viewer_protocol_policy     = "https-only"
+    allowed_methods            = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods             = ["GET", "HEAD"]
+    cache_policy_id            = data.aws_cloudfront_cache_policy.api.id
+    origin_request_policy_id   = data.aws_cloudfront_origin_request_policy.api.id
+    response_headers_policy_id = data.aws_cloudfront_response_headers_policy.security.id
+    compress                   = true
 
     function_association {
       event_type   = "viewer-request"
@@ -111,11 +116,12 @@ resource "aws_cloudfront_distribution" "frontend" {
   }
 
   default_cache_behavior {
-    target_origin_id       = "frontend-s3"
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD"]
-    cached_methods         = ["GET", "HEAD"]
-    compress               = true
+    response_headers_policy_id = data.aws_cloudfront_response_headers_policy.security.id
+    target_origin_id           = "frontend-s3"
+    viewer_protocol_policy     = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD"]
+    cached_methods             = ["GET", "HEAD"]
+    compress                   = true
 
     # Archivos sin version en el nombre: revalidar en navegador y hasta 60 s en CDN.
     min_ttl     = 0

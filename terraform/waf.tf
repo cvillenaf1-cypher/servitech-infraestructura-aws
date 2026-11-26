@@ -32,6 +32,28 @@ resource "aws_wafv2_web_acl" "frontend" {
     }
   }
 
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-frontend-known-bad-inputs"
+      sampled_requests_enabled   = false
+    }
+  }
+
   visibility_config {
     cloudwatch_metrics_enabled = true
     metric_name                = "${local.name_prefix}-frontend-waf"
@@ -66,6 +88,28 @@ resource "aws_wafv2_web_acl" "api" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "${local.name_prefix}-api-common"
+      sampled_requests_enabled   = false
+    }
+  }
+
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-api-known-bad-inputs"
       sampled_requests_enabled   = false
     }
   }
