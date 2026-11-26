@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lambda" / "shared"))
+
 sys.modules.setdefault("boto3", types.ModuleType("boto3"))
 sys.modules.setdefault("psycopg2", types.ModuleType("psycopg2"))
 
@@ -75,7 +77,7 @@ class TestEstado(unittest.TestCase):
     def test_tecnico_tiene_rol(self):
         self.assertTrue(
             estado.verificar_rol_estado(
-                evento(grupos=["Tecnico"])
+                evento(grupos=["Técnico"])
             )
         )
 
@@ -107,11 +109,11 @@ class TestEvidencias(unittest.TestCase):
     def test_cliente_ajeno(self):
         with patch.object(
             evidencias,
-            "verificar_propietario",
+            "verificar_acceso",
             return_value=403,
         ):
             resultado = evidencias.lambda_handler(
-                evento(), None
+                evento(grupos=["Cliente"]), None
             )
 
         self.assertEqual(resultado["statusCode"], 403)

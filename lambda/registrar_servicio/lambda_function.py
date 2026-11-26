@@ -4,20 +4,11 @@ import json
 import os
 
 import boto3
+from servitech_authz import (
+    AuthenticationError, AuthorizationDenied, identity_from_rest_event,
+    CLIENTE, response,
+)
 import psycopg2
-
-
-def response(status_code, body):
-    return {
-        "statusCode": status_code,
-        "headers": {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Content-Type",
-            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-            "Content-Type": "application/json",
-        },
-        "body": json.dumps(body),
-    }
 
 
 def get_request_body(event):
@@ -71,39 +62,24 @@ def get_connection():
         connect_timeout=5,
     )
 
-def obtener_cliente_autenticado(event):
-    if not isinstance(event, dict):
-        return None
-
-    request_context = event.get("requestContext") or {}
-    authorizer = request_context.get("authorizer") or {}
-    claims = authorizer.get("claims") or {}
-
-    if not isinstance(claims, dict):
-        return None
-
-    cliente_sub = claims.get("sub")
-
-    if not isinstance(cliente_sub, str):
-        return None
-
-    cliente_sub = cliente_sub.strip()
-
-    return cliente_sub if cliente_sub else None
-
 def lambda_handler(event, context):
     try:
         body = get_request_body(event)
     except ValueError as error:
         return response(400, {"message": str(error)})
 
-    cliente_sub = obtener_cliente_autenticado(event)
+    try:
+        identity = identity_from_rest_event(event)
+        if CLIENTE not in identity.groups:
+            raise AuthorizationDenied()
+    except AuthenticationError:
+        return response(401, {"message": "Se requiere un cliente autenticado."})
+    except AuthorizationDenied:
+        return response(403, {"message": "Solo el Cliente puede registrar su propio servicio."})
 
-    if cliente_sub is None:
-        return response(
-            401,
-            {"message": "Se requiere un cliente autenticado."},
-        )
+    sede_id = body.get("sede_id")
+    if not isinstance(sede_id, str) or not sede_id.strip() or "\x00" in sede_id:
+        return response(400, {"message": "Se requiere una sede válida."})
 
     connection = None
     try:
@@ -111,23 +87,21 @@ def lambda_handler(event, context):
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-             INSERT INTO public.servicios (
-                cliente,
-                equipo,
-                descripcion,
-                cliente_sub
-            )
-            VALUES (%s, %s, %s, %s)
-            RETURNING id;
+                INSERT INTO public.servicios (
+                    cliente, equipo, descripcion, cliente_sub, sede_id
+                )
+                SELECT %s, %s, %s, %s, id
+                FROM public.sedes WHERE id = %s AND activa
+                RETURNING id;
                 """,
-                        (
-            body["cliente"],
-            body["equipo"],
-            body["descripcion"],
-            cliente_sub,
-        ),
+                (body["cliente"], body["equipo"], body["descripcion"],
+                 identity.sub, sede_id),
             )
-            service_id = cursor.fetchone()[0]
+            created = cursor.fetchone()
+            if created is None:
+                connection.rollback()
+                return response(403, {"message": "Sede no disponible."})
+            service_id = created[0]
 
         connection.commit()
         return response(

@@ -3,22 +3,16 @@ import os
 import re
 
 import boto3
+from servitech_authz import (
+    AuthenticationError, AuthorizationDenied, identity_from_rest_event,
+    service_access_predicate, STAFF_ROLES, CLIENTE, response,
+)
 import psycopg2
 from botocore.config import Config
 
 
 class CognitoNoDisponible(RuntimeError):
     """No se pudo completar la consulta del propietario de forma segura."""
-
-
-def response(status_code, body):
-    return {
-        "statusCode": status_code,
-        "headers": {
-            "Content-Type": "application/json"
-        },
-        "body": json.dumps(body),
-    }
 
 
 def get_connection():
@@ -89,23 +83,23 @@ def validate_request(event):
 
     return service_id, estado.strip()
 
-def obtener_servicio(cursor, service_id):
+def obtener_servicio(cursor, service_id, access):
     cursor.execute(
         """
         SELECT estado, version, cliente_sub
-        FROM public.servicios
-        WHERE id = %s
-        FOR UPDATE;
-        """,
-        (service_id,),
+        FROM public.servicios AS svc
+        WHERE svc.id = %s AND
+        """ + access.sql + " FOR UPDATE OF svc;",
+        (service_id, *access.params),
     )
     return cursor.fetchone()
 
 
 def actualizar_estado_e_historial(
-    cursor, service_id, estado_nuevo, actor_sub=None
+    cursor, service_id, estado_nuevo, identity
 ):
-    servicio = obtener_servicio(cursor, service_id)
+    access = service_access_predicate(identity, staff_roles=STAFF_ROLES)
+    servicio = obtener_servicio(cursor, service_id, access)
 
     if servicio is None:
         return None
@@ -117,16 +111,18 @@ def actualizar_estado_e_historial(
 
     cursor.execute(
         """
-        UPDATE public.servicios
+        UPDATE public.servicios AS svc
         SET estado = %s,
             version = version + 1
-        WHERE id = %s
-        RETURNING version;
-        """,
-        (estado_nuevo, service_id),
+        WHERE svc.id = %s AND
+        """ + access.sql + " RETURNING version;",
+        (estado_nuevo, service_id, *access.params),
     )
 
-    version_nueva = cursor.fetchone()[0]
+    updated = cursor.fetchone()
+    if updated is None:
+        raise AuthorizationDenied("La autorización cambió durante la operación.")
+    version_nueva = updated[0]
 
     cursor.execute(
         """
@@ -144,7 +140,7 @@ def actualizar_estado_e_historial(
             version_nueva,
             estado_anterior,
             estado_nuevo,
-            actor_sub,
+            identity.sub,
         ),
     )
 
@@ -194,23 +190,7 @@ def registrar_evento_outbox(cursor, cambio, telefono_verificado_e164):
 
 
 def obtener_actor_autenticado(event):
-    if not isinstance(event, dict):
-        raise ValueError("Solicitud inválida.")
-
-    request_context = event.get("requestContext") or {}
-    authorizer = request_context.get("authorizer") or {}
-    claims = authorizer.get("claims") or {}
-
-    if not isinstance(claims, dict):
-        raise ValueError("No se pudo verificar la identidad.")
-
-    actor_sub = claims.get("sub")
-
-    if not isinstance(actor_sub, str) or not actor_sub.strip():
-        raise ValueError("No se encontró un usuario autenticado.")
-
-    return actor_sub
-
+    return identity_from_rest_event(event).sub
 
 
 def consultar_cognito(operacion, context, **parametros):
@@ -378,33 +358,10 @@ def publicar_evento_pendiente(connection, event_id, cambio, telefono):
 
 
 def verificar_rol_estado(event):
-    contexto = event.get("requestContext") or {}
-    autorizador = contexto.get("authorizer") or {}
-    claims = autorizador.get("claims") or {}
-
-    grupos = claims.get("cognito:groups", [])
-
-    if isinstance(grupos, str):
-        try:
-            grupos = json.loads(grupos)
-        except json.JSONDecodeError:
-            grupos = grupos.strip("[]").split(",")
-
-    if isinstance(grupos, str):
-        grupos = [grupos]
-
-    if not isinstance(grupos, list):
+    try:
+        return bool(identity_from_rest_event(event).groups.intersection(STAFF_ROLES))
+    except (AuthenticationError, AuthorizationDenied):
         return False
-
-    grupos = {
-        grupo.strip().strip("'\"")
-        for grupo in grupos
-        if isinstance(grupo, str)
-    }
-
-    permitidos = {"Tecnico", "Técnico", "Administrador"}
-
-    return bool(grupos.intersection(permitidos))
 
 
 def lambda_handler(event, context):
@@ -414,11 +371,11 @@ def lambda_handler(event, context):
         return response(400, {"message": str(error)})
 
     try:
-        actor_sub = obtener_actor_autenticado(event)
-    except ValueError:
+        identity = identity_from_rest_event(event)
+        service_access_predicate(identity, staff_roles=STAFF_ROLES)
+    except AuthenticationError:
         return response(401, {"message": "Usuario no autenticado."})
-
-    if not verificar_rol_estado(event):
+    except AuthorizationDenied:
         return response(
             403,
             {"message": "No tienes permisos para actualizar estados."},
@@ -434,7 +391,7 @@ def lambda_handler(event, context):
                 cursor,
                 service_id,
                 estado_nuevo,
-                actor_sub,
+                identity,
             )
 
             if cambio is None:
@@ -479,6 +436,11 @@ def lambda_handler(event, context):
             },
         )
 
+
+    except AuthorizationDenied:
+        if connection is not None:
+            connection.rollback()
+        return response(403, {"message": "Acceso no autorizado."})
 
     except CognitoNoDisponible:
         if connection is not None:

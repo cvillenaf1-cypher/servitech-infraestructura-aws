@@ -4,298 +4,115 @@ ServiTech permite registrar y consultar servicios técnicos. Terraform administr
 la infraestructura del MVP. La demostración requiere un INSERT real en PostgreSQL
 y un SELECT del mismo registro por el ID devuelto; una respuesta simulada no basta.
 
-## Cognito: primera fase de autenticación
+## Identidad, autorización y API
 
-La referencia técnica es exclusivamente la Página 3 del diagrama oficial,
-que no forma parte del repositorio. Esta fase declara Cognito en
-`terraform/cognito.tf`. `us-east-2` es la región predeterminada del código;
-la región efectiva de despliegue todavía debe verificarse, porque los workflows
-inyectan `TF_VAR_aws_region` desde el secreto `AWS_REGION` de GitHub.
-El stage sigue siendo `dev`; no se modifica el backend ni el workspace.
-La infraestructura declarada no implica que esté desplegada.
+La referencia es exclusivamente la Página 3 del diagrama oficial, junto con
+las contribuciones existentes y el [PR #1 de Checkov](https://github.com/cvillenaf1-cypher/servitech-infraestructura-aws/pull/1).
+No se incorpora el diagrama al repositorio. La región predeterminada es
+`us-east-2`; la región efectiva todavía depende de la configuración de despliegue.
+Se conserva el stage `dev`, el backend y el workspace.
 
-| Decisión | Configuración |
-| --- | --- |
-| User Pool | `${local.name_prefix}-usuarios`, protección de borrado activa y `prevent_destroy` para conservar los identificadores `sub`. |
-| Plan de Cognito | `LITE`, suficiente para los flujos configurados. |
-| Login | Username administrativo sin distinción de mayúsculas; SDK/SRP, sin dominio de User Pool ni OAuth. Email y teléfono son datos de contacto, no alias de login. |
-| Alta y recuperación | Solo administración autorizada mediante IAM. El grupo de aplicación Administrador no otorga permisos IAM para gestionar Cognito. |
-| App Client | Público, sin secreto; `ALLOW_USER_SRP_AUTH` y `ALLOW_REFRESH_TOKEN_AUTH`. |
-| Contraseña | Mínimo 12 caracteres, mayúscula, minúscula, número y símbolo; contraseña temporal válida 3 días. |
-| MFA | TOTP opcional, sin SMS. La pertenencia a un grupo no obliga por sí sola a usar MFA. |
-| Tokens | ID y access: 15 minutos; refresh: 1 día; sesión de desafío: 3 minutos. |
-| Seguridad del cliente | Errores de existencia de usuario suprimidos y revocación habilitada. Rotación de refresh deshabilitada para conservar `REFRESH_TOKEN_AUTH`. |
-| Lectura de atributos | `sub`, `name`, `email`, `email_verified`, `phone_number`, `phone_number_verified`. |
-| Escritura de atributos | Solo `name`. Contacto, indicadores de verificación y futuros atributos de autorización no son editables desde este cliente. |
-| Grupos | `Cliente`, `Técnico` y `Administrador`, sin roles IAM asociados ni acceso global implícito. |
+### Cognito y sedes
 
-Los atributos estándar conservan su esquema de Cognito; email, nombre y teléfono
-son opcionales. No se crean usuarios, contraseñas, teléfonos ni membresías en
-Terraform. La administración deberá asignar los grupos expresamente y entregar
-las credenciales iniciales por un canal seguro. Si utiliza invitaciones, deberá
-elegir entrega EMAIL con un correo real o suprimir el envío y coordinar la entrega;
-no debe depender de SMS mientras ese canal no esté configurado.
-El futuro cliente SDK debe atender `NEW_PASSWORD_REQUIRED`, enrolamiento/desafíos
-TOTP cuando corresponda, renovación y cierre de sesión. Revocar un refresh token
-no garantiza que un consumidor que solo valida la firma de un JWT deje de aceptar
-inmediatamente el ID/access token ya emitido; se debe considerar su expiración.
+- User Pool con alta administrativa, grupos exactos `Cliente`, `Técnico` y
+  `Administrador`, sin roles IAM asociados. App Client público sin secreto,
+  login SDK/SRP, sin dominio de User Pool ni OAuth. TOTP opcional; contraseñas
+  de 12 caracteres con complejidad y vigencia temporal de 3 días.
+- ID/access tokens: 15 minutos; refresh: 1 día. El App Client solo escribe
+  `name`; no puede cambiar contacto, indicadores de verificación ni permisos.
+  Outputs: `cognito_user_pool_id`, `cognito_user_pool_arn`, `cognito_app_client_id`.
+- Identidad estable: `sub` opaco, sin normalizar. No se crea `custom:sede_id`.
+  La migración aditiva 003 crea `sedes` y `usuario_sede_rol`, con PK compuesta
+  `(usuario_sub, sede_id, rol)`, FK a `sedes` e índice `(sede_id, rol)`.
+  Admite múltiples roles y sedes; ambos registros quedan inactivos por defecto.
+- `servitech_app` solo lee las nuevas tablas. El script de permisos revoca
+  concesiones directas y por columna a la app/PUBLIC y rechaza escritura
+  heredada o propiedad administrativa. Las asignaciones se gestionan con una
+  identidad administrativa separada; no se crean usuarios ni sedes ficticias.
+  Revisar también funciones externas SECURITY DEFINER y cambios futuros de IAM/SQL.
+- Las migraciones 001/002 y los históricos permanecen intactos. No se añade FK
+  desde `servicios` ni se rellenan propietarios o sedes automáticamente.
 
-Outputs públicos de integración: `cognito_user_pool_id`, `cognito_user_pool_arn`
-y `cognito_app_client_id`. No contienen secretos. `sub` identifica al usuario
-de forma estable dentro del pool; no debe sustituirse por username, email o
-teléfono. `cognito:groups` lo emite Cognito a partir de las membresías administradas,
-no es un atributo editable del App Client. Se usa la grafía `Técnico`, ya admitida
-por las Lambda existentes.
+| Operación | Cliente | Técnico / Administrador |
+| --- | --- | --- |
+| Registrar | Para sí mismo, indicando `sede_id` catalogada y activa | Solo si también tiene el grupo Cliente, siempre para sí mismo |
+| Consultar / subir o descargar evidencia | Servicio propio en sede válida y activa; sin asignación operativa | Grupo Cognito y asignación activa del mismo rol en la sede activa |
+| Diagnóstico / estado | Denegado por el rol Cliente | Grupo Cognito y asignación activa del mismo rol en la sede activa |
+| Administrar asignaciones o cambiar propietario/sede | No disponible en la API | No disponible en la API |
 
-### Sedes y verificación telefónica
+No hay acceso global del Administrador ni propagación de privilegios entre sedes.
+Los servicios sin propietario válido o sede activa se deniegan, incluido el
+histórico incompleto. La regularización requiere intervención administrativa.
 
-Por decisión del equipo, **no se crea `custom:sede_id`**. Cognito administra
-identidad y grupos; PostgreSQL administra las asignaciones de usuario, rol y
-sede. El modelo admite múltiples sedes y distintos roles por sede, sin acceso
-global implícito del Administrador. La etapa 3.1 define las tablas descritas
-más adelante; aplicar estas reglas en las Lambda queda para otra etapa.
+### Módulo y flujos
 
-El teléfono debe pertenecer al cliente propietario y tener formato E.164.
-Esta fase no configura SMS ni verificación automática, y no establece
-`phone_number_verified=true`. Para habilitar la verificación real faltan el canal
-de entrega, rol de servicio y permisos, región de mensajería, condiciones del
-sandbox, destinos/origen autorizados y flujo SDK de envío y comprobación del código.
-Verificar un destino del sandbox o confirmar una cuenta no sustituye verificar
-el atributo del usuario. Debe definirse también cómo verificar un número nuevo
-antes de sustituir el teléfono vigente. Mantener `phone_number` sin escritura
-desde el cliente hasta completar ese flujo.
+`lambda/shared/servitech_authz.py` se empaqueta en las cinco Lambda. Lee solo
+`requestContext.authorizer.claims`, conserva `sub` y admite grupos como CSV o
+lista de strings exactos. Rechaza `Tecnico`, grupos desconocidos y cadenas con
+comillas/corchetes. El [ejemplo REST de AWS](https://aws.amazon.com/blogs/mobile/new-real-time-multi-group-app-with-aws-amplify-graphql-build-a-twitter-community-clone/)
+usa CSV; el [token Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-id-token.html)
+contiene una lista. Confirmar el formato del evento real durante el despliegue.
+El módulo confía en API Gateway/IAM: no verifica firmas JWT ni acepta identidad
+proporcionada por body o cabeceras arbitrarias. No exponer invocación directa
+sin IAM; nunca reenviar claims del navegador sin pasar por el autorizador.
 
-### Límites de integración de esta fase
+Los filtros parametrizados de propiedad/rol/sede forman parte del SELECT,
+INSERT o UPDATE. Se deniega por defecto y no se cachean permisos. Una consulta
+sin fila autorizada devuelve 404, sin distinguir ausencia de falta de acceso;
+claims inválidos devuelven 401/403 y fallos de infraestructura 500/503.
+La autorización usa la vista de permisos de la sentencia SQL; una revocación
+concurrente no cancela una operación ya iniciada ni una URL prefirmada emitida.
+No se añaden protocolos de bloqueos asesores ni mecanismos administrativos nuevos.
 
-- Se conservan las cinco Lambda y el IAM del RDS Proxy en `identity.tf`.
-  No se modifica API Gateway, frontend, CloudFront, WAF, Route 53 ni ACM.
-- La conexión privada de `ActualizarEstado`, pendiente al terminar la fase 1,
-  se incorpora en la fase 2 descrita a continuación.
-- No asignar un dominio al User Pool: se reserva la compatibilidad con
-  PrivateLink. El navegador usará el endpoint público de Cognito mediante SDK.
-- La configuración de identidad no implementa aún el autorizador REST ni las
-  comprobaciones de sede. Tampoco implementa las responsabilidades de Jhonatan.
-- La retención requerida de logs es **14 días**. El monitoreo heredado de las
-  secciones siguientes todavía declara 7 días para dos Lambda; su corrección y
-  la cobertura restante se coordinan con Jhonatan. Cognito no añade grupos de
-  logs ni modifica retenciones en esta fase.
-- Antes de un despliegue futuro, reconciliar el workspace compartido con
-  `TF_WORKSPACE=default` de CI y verificar recursos existentes para no duplicarlos.
-  No cambiar el estado para resolver esa diferencia. El resto de esta guía
-  contiene procedimientos heredados del MVP, no pasos ejecutados en esta fase.
-- Se conservan `prevent_destroy = true` y `deletion_protection = "ACTIVE"`.
-  Cuando el User Pool exista en el estado, `destroy-dev.yml` no podrá completar
-  su plan de destrucción por `prevent_destroy`; Cognito también impedirá borrar
-  el pool mientras su protección esté activa. Confirmar `DESTROY` no desactiva
-  estas protecciones. El procedimiento de destrucción controlada de DEV queda
-  pendiente para una fase independiente, antes de finalizar el Pull Request,
-  manteniendo ambas protecciones en producción.
+`ActualizarEstado` conserva el bloqueo de servicio y la transacción
+estado + historial + outbox. Recomprueba el filtro en el UPDATE y consulta al
+propietario en Cognito mediante el endpoint privado existente: `ListUsers`
+resuelve el username y `AdminGetUser` valida sub, cuenta habilitada, teléfono
+E.164 y `phone_number_verified=true`. Una comprobación fallida revierte todo;
+solo se publica después del commit. No se modifica el despacho del outbox.
+El endpoint/IAM siguen limitados al rol Lambda 4, pool y operaciones de lectura.
 
-Referencias: [atributos y permisos de Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-attributes.html),
-[PrivateLink](https://docs.aws.amazon.com/cognito/latest/developerguide/vpc-interface-endpoints.html)
-y [configuración SMS](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-sms-settings.html).
+`GestionarEvidencias` invoca sincrónicamente a `ConsultarServicio` con IAM limitado
+a su ARN y exige una respuesta válida para el servicio antes de firmar una URL.
+Según Página 3, Lambda 5 queda fuera de la VPC: ya no consulta PostgreSQL ni
+necesita permisos RDS/ENI; conserva acceso limitado a `servicios/*` de S3.
+No se añade NAT ni endpoint. Las URL duran 300 segundos, preservan tipos
+JPG/PNG/PDF y claves por servicio. S3 mantiene su CORS restringido al frontend.
 
-## Fase 2: consulta privada de Cognito desde ActualizarEstado
+### API y validación
 
-`terraform/cognito_network.tf` declara un endpoint de interfaz `cognito-idp`
-en `aws_vpc.main`, con una interfaz en cada subred `private_app_a` y
-`private_app_b`. El DNS privado utiliza el DNS ya habilitado en la VPC; el SDK
-resuelve el endpoint regional hacia IP privadas sin configurar una URL especial.
-No se crean VPC, subredes, NAT ni Internet Gateway. La Página 3 exige el teléfono
-verificado del destinatario, pero no dibuja esta conexión Lambda 4–Cognito;
-el endpoint completa esa dependencia según el alcance autorizado de la fase 2.
+| Método | Ruta | Lambda |
+| --- | --- | --- |
+| POST | `/servicios` | RegistrarServicio |
+| GET | `/servicios/{id}` | ConsultarServicio |
+| PATCH | `/servicios/{id}/diagnostico` | ActualizarDiagnostico |
+| PATCH | `/servicios/{id}/estado` | ActualizarEstado |
+| POST | `/servicios/{id}/evidencias` | GestionarEvidencias |
 
-El SG exclusivo `cognito_endpoint` admite TCP 443 únicamente desde
-`lambda4_publisher`, actualmente asociado solo a `ActualizarEstado`. Se añade
-una regla de salida a ese destino sin alterar las reglas de EventBridge ni el
-SG `rds_proxy_client`. No asociar `lambda4_publisher` a otras funciones: ampliaría
-el acceso de red. El endpoint no necesita salida iniciada por él para responder
-a conexiones permitidas, porque los SG mantienen el estado de las conexiones.
+Las cinco rutas usan el autorizador Cognito del pool existente y un **ID token**
+del App Client configurado en `Authorization`; el autorizador comprueba `aud`.
+OPTIONS es público. Preflight, errores de Gateway y respuestas Lambda permiten
+`Authorization`, `Content-Type` y los métodos usados. Se conserva origen `*`
+sin cookies; acotarlo al origen aprobado al completar el frontend.
+Se reutilizan API, recursos y stage. Se incorporan las correcciones aplicables
+CKV_AWS_237 (ciclo de vida REST API) y CKV_AWS_73 (X-Ray del stage) del PR #1,
+sin fusionar ni copiar cambios ajenos a este alcance.
 
-Se reutilizan el rol `lambda4_exec` y la política `lambda4_cognito_lookup`.
-Ambas políticas (IAM y endpoint) permiten exclusivamente `ListUsers` y
-`AdminGetUser` sobre `aws_cognito_user_pool.servitech.arn`; la del endpoint
-solo acepta ese rol y la de IAM exige `aws:SourceVpce` del nuevo endpoint.
-No se conceden operaciones de escritura o verificación de atributos.
-La cadena de dependencias es rol/pool → endpoint → política IAM → Lambda,
-sin dependencia inversa del rol hacia su política. Se conserva un bloque
-`moved` desde la instancia anterior `[0]` para evitar recrear una política
-ya administrada en el estado.
+Validación local: `python -B -m unittest discover -s tests -v`, pruebas SQL
+explícitas en `tests/integration/check_authz_postgres.py`, empaquetado mediante
+`scripts/build_lambdas.ps1` o `scripts/build_lambdas_ci.sh`, `terraform fmt -check`,
+`terraform validate` y `git diff --check`. Ambos empaquetadores incluyen el módulo
+en la raíz de los cinco ZIP y limpian solo sus directorios temporales.
+No ejecutar ambos simultáneamente. ZIP, results.xml e informes no se incluyen en Git.
 
-`COGNITO_USER_POOL_ID` referencia directamente el pool. Se retira la variable
-`lambda4_cognito_user_pool_arn`; quienes la suministraran externamente deben
-retirarla de su configuración. No se han modificado backend, workspace o CI.
-El User Pool conserva ambas protecciones contra borrado y no tiene dominio.
-Esta conexión no convierte en privado el login SDK del navegador.
-
-La consulta toma `cliente_sub` de la fila del servicio, no del body ni del actor.
-`sub` se trata como texto opaco, sin convertirlo a UUID ni normalizarlo.
-`ListUsers` usa igualdad exacta y un valor escapado; recorre hasta cinco páginas
-y rechaza búsquedas incompletas o ambiguas. Solo resuelve el Username:
-`AdminGetUser` comprueba de nuevo Username y sub, exige `Enabled=true`,
-`phone_number_verified="true"` y teléfono E.164. La aplicación no establece
-ninguno de esos indicadores ni sustituye la verificación real.
-
-Un propietario ausente, identidad incoherente, cuenta deshabilitada o teléfono
-sin verificar provoca HTTP 409 y rollback. Los fallos de consulta, búsqueda
-incompleta o tiempo insuficiente provocan HTTP 503 y rollback. No se inserta
-el outbox ni se publica el evento si falla esta comprobación; los cambios de
-estado e historial ejecutados antes se revierten. Se conserva el procesamiento
-existente del outbox y EventBridge. El SDK usa 1 s de conexión, 2 s de lectura,
-un solo intento y comprueba que resten más de 4 s antes de cada llamada.
-Esto reduce la espera dentro de la transacción, pero no garantiza un plazo
-total ante DNS lento, bloqueos SQL o un timeout forzado del runtime.
-
-Las pruebas de `tests/test_cognito_estado.py` usan respuestas ficticias locales
-para verificar éxito, paginación, identidad, teléfono, fallos y rollback; no
-crean usuarios ni marcan teléfonos reales como verificados. Se ejecutan con
-`python -B -m unittest discover -s tests -v`. Los paquetes se regeneran con
-`scripts/build_lambdas.ps1` y permanecen ignorados en `build/`.
-
-Pendientes antes del despliegue y de la integración completa:
-
-- Verificar región efectiva, cuenta, estado compartido y ausencia de otro
-  endpoint `cognito-idp` con DNS privado en la misma VPC. Confirmar disponibilidad
-  del servicio en ambas AZ, IP libres, cuotas y reglas NACL/DNS efectivas.
-- Verificar permisos del ejecutor Terraform para gestionar endpoint, SG/reglas,
-  política inline del rol y configuración de Lambda, incluido `iam:PassRole`.
-  Las validaciones locales no comprueban permisos AWS ni conectividad real.
-- Aprovisionar propietarios reales, enlazar su sub al servicio y completar el
-  flujo real de verificación telefónica. `ListUsers` tiene consistencia eventual:
-  un usuario recién creado puede no aparecer todavía y la operación se rechaza.
-- Probar en AWS, tras autorización de despliegue, DNS privado, acceso desde
-  Lambda 4, denegación desde otros roles y rollback con PostgreSQL real.
-  Considerar el coste de las dos interfaces PrivateLink y que `AdminGetUser`
-  contribuye al cómputo de usuarios activos mensuales de Cognito.
-- Mantener pendientes API/autorizador y autorización por sede, la configuración
-  del bus y los contratos/reintentos del outbox a cargo de sus responsables,
-  y la destrucción controlada de DEV antes de finalizar el PR. Esta fase no
-  modifica esos componentes ni la retención de logs (requisito: 14 días).
-
-Referencias: [PrivateLink y políticas de Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/vpc-interface-endpoints.html),
-[ListUsers y consistencia eventual](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_ListUsers.html),
-[AdminGetUser](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AdminGetUser.html).
-
-## Etapa 3.1: sedes y asignaciones administrativas
-
-**Alcance implementado:** esquema y permisos SQL; no se modifica ninguna Lambda
-ni se activa todavía la autorización descrita en esta sección. La Página 3 del
-diagrama exige comprobar propietario, rol y sede y reutilizar la consulta de
-acceso para evidencias. Las tablas y el soporte multisede son la solución
-aprobada por el equipo, no detalles prescritos por el diagrama.
-
-`sql/migrations/003_sedes_asignaciones.sql` es aditiva y transaccional:
-
-| Tabla | Contrato |
-| --- | --- |
-| `public.sedes` | `id` de texto, clave primaria; `nombre` obligatorio; `activa` inicialmente `false`; `creado_en` con zona horaria. Identificador y nombre no pueden estar vacíos. |
-| `public.usuario_sede_rol` | Clave primaria `(usuario_sub, sede_id, rol)`; `usuario_sub` opaco y no vacío; `sede_id` referencia a `sedes.id`; `rol` es exactamente `Cliente`, `Técnico` o `Administrador`; `activo` inicialmente `false`; `creado_en` con zona horaria. |
-
-La clave compuesta permite varios roles por sede y distintas sedes por usuario,
-sin duplicar una misma asignación. La FK restringe borrados y cambios de ID de
-sedes referenciadas; no hay cascadas. La PK indexa consultas por usuario/sede/rol
-y un índice `(sede_id, rol)` cubre consultas administrativas y la FK, incluidas
-asignaciones inactivas. No se crean usuarios SQL por cada usuario Cognito ni una
-FK hacia Cognito. Los nuevos scripts fijan la codificación de psql a UTF-8 para
-conservar la grafía `Técnico` también en clientes Windows.
-La identidad administrativa debe comprobar el `sub` real en
-el User Pool configurado; no se exige UUID ni se transforma el identificador.
-El modelo supone un solo User Pool para la aplicación; admitir varios exigiría
-incorporar el emisor a las claves antes de reutilizar identificadores.
-
-No se insertan sedes, usuarios ni asignaciones. `servicios.cliente_sub` y
-`servicios.sede_id`, sus índices, historial y outbox se conservan sin cambios.
-No se añade una FK de `servicios` a `sedes`: los registros históricos pueden
-contener NULL o identificadores aún no catalogados. No se rellenan ni corrigen
-automáticamente. Una futura regularización administrativa necesitará inventario,
-aprobación y trazabilidad antes de plantear esa FK. Una FK `NOT VALID` también
-condicionaría nuevas escrituras; por ello tampoco se incorpora en esta etapa.
-
-### Lectura de aplicación y administración separada
-
-El propietario de las tablas debe ser una identidad administrativa de migración
-separada de `servitech_app`. Las asignaciones se administran únicamente desde
-una sesión administrativa autorizada; pertenecer al grupo Cognito Administrador
-no concede acceso SQL ni permite administrar asignaciones desde la aplicación.
-No se crean credenciales, logins administrativos ni permisos IAM en esta etapa.
-
-`sql/grant_sedes_lectura.sql` otorga a `servitech_app` solo `SELECT` sobre las dos
-tablas, sin opción de concesión. Revoca sus concesiones directas y las de
-`PUBLIC`, tanto de tabla como de columna, incluidas las materializadas desde
-privilegios predeterminados al crear las tablas. Comprueba propiedad, facultades
-administrativas, `CREATE`, escritura y opciones de concesión de lectura en el
-rol y sus membresías transitivas. Incluye conservadoramente roles con membresía
-aunque `NOINHERIT` o `SET FALSE` limiten su uso actual. Si encuentra una exposición
-heredada, aborta la transacción; no cambia permisos de otros roles compartidos.
-Se deben corregir esas membresías/concesiones con autorización y volver a ejecutar.
-
-El script no modifica `ALTER DEFAULT PRIVILEGES` de los compañeros: comprueba los
-permisos efectivos resultantes sobre estas tablas. Se ejecuta dentro de la
-migración si la aplicación ya existe y desde el aprovisionamiento para nuevas
-instalaciones. Si el rol aún no existe, retira acceso de `PUBLIC` y deja un aviso;
-los permisos de aplicación se establecerán al aprovisionarlo. También se puede
-volver a ejecutar por separado: su bloque `DO` es atómico. La identidad ejecutora
-debe poder revocar todas las concesiones revisadas y no debe ser la aplicación.
-
-Antes de un despliegue autorizado, revisar también funciones `SECURITY DEFINER`
-ejecutables por la aplicación y otros caminos de elevación existentes: la
-comprobación de ACL y membresías no analiza el cuerpo de funciones externas.
-Nuevos grants, cambios de propietario o membresías posteriores necesitan revisión
-y nueva comprobación. `NOINHERIT` por sí solo no protege frente a `SET ROLE`.
-Referencias: [privilegios PostgreSQL](https://www.postgresql.org/docs/16/ddl-priv.html),
-[membresías](https://www.postgresql.org/docs/16/role-membership.html) y
-[privilegios predeterminados](https://www.postgresql.org/docs/16/sql-alterdefaultprivileges.html).
-
-Administración prevista: registrar un ID y nombre de sede reales, comprobar el
-`sub` y los grupos del usuario, registrar el rol correspondiente y activar de
-forma explícita la sede y la asignación. Para revocar, desactivar la asignación
-concreta; para suspender una sede, desactivarla. No borrar registros para revocar
-acceso. El modelo conserva el estado de la asignación y su fecha de creación,
-pero no constituye un historial de cambios administrativos: el procedimiento
-de auditoría y las identidades autorizadas para gestionarlo quedan por definir.
-
-### Matriz de autorización propuesta para la siguiente etapa
-
-Toda autorización requerirá identidad autenticada y coincidencia exacta entre
-grupo Cognito y asignación **activa del mismo rol y sede**, además de sede activa.
-Un grupo sin asignación o una asignación sin grupo no autoriza. Los roles no
-tienen jerarquía implícita: Administrador en A y Técnico en B no equivale a
-Administrador en B. En particular, el Cliente también necesita su asignación
-activa en la sede; para servicios existentes debe ser su propietario.
-
-| Operación | Cliente | Técnico | Administrador |
-| --- | --- | --- | --- |
-| Registrar servicio | Para sí mismo, en una sede autorizada | Denegado hasta definir recepción por terceros | Denegado hasta definir recepción por terceros |
-| Consultar servicio y evidencias | Propio, en sede autorizada | En sede autorizada | En sede autorizada |
-| Modificar diagnóstico/presupuesto | Denegado | En sede autorizada | En sede autorizada |
-| Cambiar estado | Denegado | En sede autorizada, según transiciones por definir | En sede autorizada, según transiciones por definir |
-| Cargar evidencia | Propia, en sede autorizada; pendiente ratificar regla de negocio | En sede autorizada | En sede autorizada |
-| Cambiar propietario/sede o administrar asignaciones desde la aplicación | Denegado | Denegado | Denegado |
-
-Se denegará por defecto si faltan identidad, propietario o sede válidos, si la
-sede/asignación está inactiva, o si PostgreSQL no permite comprobar la regla.
-Nunca se tomará del body un grupo o asignación como evidencia de autorización.
-La siguiente etapa deberá consultar estas tablas desde las Lambda, comprobar
-permisos dentro de las transacciones de escritura y resolver la concurrencia con
-revocaciones. Las pruebas de autorización deberán cubrir varios roles/sedes,
-identificadores opacos, históricos incompletos y fallos de consulta. Esta
-migración no sustituye esas comprobaciones ni añade RLS a `servicios`.
-
-Se mantiene como referencia el [PR #1 de Checkov](https://github.com/cvillenaf1-cypher/servitech-infraestructura-aws/pull/1):
-sus correcciones de SG, S3, API, RDS y monitoreo se revisarán en sus respectivas
-etapas; no contienen una migración reutilizable para este modelo. No se fusiona
-ni se copia ese PR. Se mantienen las protecciones de Cognito y el requisito de
-logs de **14 días**, sin modificar Terraform ni workflows.
-
-Pruebas SQL reproducibles: `tests/sql/test_sedes_asignaciones.sql`, exclusivamente
-en una base PostgreSQL local desechable con esquema y `servitech_app` ya
-aprovisionados. Usa datos sintéticos de prueba dentro de una transacción que
-finaliza con `ROLLBACK`; no es un script de datos iniciales. Ejecutar con
-`psql -X -v ON_ERROR_STOP=1 -f tests/sql/test_sedes_asignaciones.sql` solo contra
-esa base local. Verificar también instalación nueva, actualización con registros
-históricos, repetición de la migración y rechazo de permisos heredados antes de
-aplicar en un entorno real. Las 33 pruebas Python de regresión se ejecutan con
-`python -B -m unittest discover -s tests -v`; no validan SQL real.
+Pendientes de despliegue: aplicar las migraciones con autorización; cargar sedes,
+usuarios y asignaciones reales; implementar login SDK y envío del ID token en el
+frontend; comprobar región, permisos AWS, conectividad, CORS y eventos reales.
+El flujo real de verificación telefónica/SMS sigue pendiente; no se simula.
+Las protecciones `prevent_destroy` y `deletion_protection=ACTIVE` bloquean
+`destroy-dev.yml`: el procedimiento controlado de DEV se resolverá por separado.
+El requisito de logs sigue siendo 14 días; las retenciones heredadas de 7 días
+y el resto del monitoreo se coordinan con Jhonatan. No se modifica ese trabajo.
 
 ## Arquitectura
 
@@ -559,8 +376,9 @@ con la identidad autenticada. Un campo de propiedad o sede nulo requiere
 resolución antes de usarlo como evidencia de acceso. Quedan por definir el
 catálogo y las transiciones de estados, la moneda del presupuesto, el
 contenido real del catálogo de sedes. La fuente de roles es Cognito y su alcance
-por sede se registra en PostgreSQL según la etapa 3.1; su comprobación en las
-Lambda sigue pendiente. El SQL no inventa esos valores.
+por sede se registra en PostgreSQL y ya se comprueba en las Lambda. El Cliente
+accede a sus propios servicios en una sede activa sin asignación operativa.
+El SQL no inventa esos valores.
 
 `ActualizarDiagnostico` utiliza `diagnostico`, `tratamiento` y `presupuesto`.
 `ActualizarEstado` debe leer y bloquear la fila del servicio con `SELECT ...

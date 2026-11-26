@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 # Evita necesitar AWS o PostgreSQL para estas pruebas.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lambda" / "shared"))
+
 sys.modules.setdefault("boto3", types.ModuleType("boto3"))
 sys.modules.setdefault("psycopg2", types.ModuleType("psycopg2"))
 
@@ -65,7 +67,7 @@ def evento(sub=None):
 
     if sub is not None:
         datos["requestContext"] = {
-            "authorizer": {"claims": {"sub": sub}}
+            "authorizer": {"claims": {"sub": sub, "cognito:groups": "Cliente"}}
         }
 
     return datos

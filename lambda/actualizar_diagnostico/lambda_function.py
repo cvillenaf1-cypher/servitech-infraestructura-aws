@@ -3,15 +3,11 @@ import os
 from decimal import Decimal, InvalidOperation
 
 import boto3
+from servitech_authz import (
+    AuthenticationError, AuthorizationDenied, identity_from_rest_event,
+    service_access_predicate, STAFF_ROLES, CLIENTE, response,
+)
 import psycopg2
-
-
-def response(status_code, body):
-    return {
-        "statusCode": status_code,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
-    }
 
 
 def get_connection():
@@ -95,69 +91,14 @@ def validate_request(event):
     return service_id, changes
 
 
-def verificar_rol_operativo(event):
-    if not isinstance(event, dict):
-        return 401
-
-    contexto = event.get("requestContext") or {}
-    if not isinstance(contexto, dict):
-        return 401
-
-    autorizador = contexto.get("authorizer") or {}
-    if not isinstance(autorizador, dict):
-        return 401
-
-    claims = autorizador.get("claims") or {}
-    if not isinstance(claims, dict):
-        return 401
-
-    usuario_sub = claims.get("sub")
-
-    if not isinstance(usuario_sub, str) or not usuario_sub.strip():
-        return 401
-
-    grupos = claims.get("cognito:groups", [])
-
-    if isinstance(grupos, str):
-        grupos = {
-            grupo.strip().strip('"').strip("'")
-            for grupo in grupos.strip("[]").split(",")
-        }
-    elif isinstance(grupos, list):
-        grupos = {
-            grupo.strip()
-            for grupo in grupos
-            if isinstance(grupo, str)
-        }
-    else:
-        grupos = set()
-
-    roles_permitidos = {
-        "Tecnico",
-        "Técnico",
-        "Administrador",
-    }
-
-    if not grupos.intersection(roles_permitidos):
-        return 403
-
-    return 200
-
-
 def lambda_handler(event, context):
-    autorizacion = verificar_rol_operativo(event)
-
-    if autorizacion == 401:
-        return response(
-            401,
-            {"message": "Usuario no autenticado."},
-        )
-
-    if autorizacion == 403:
-        return response(
-            403,
-            {"message": "No tienes permisos para actualizar diagnósticos."},
-        )
+    try:
+        identity = identity_from_rest_event(event)
+        access = service_access_predicate(identity, staff_roles=STAFF_ROLES)
+    except AuthenticationError:
+        return response(401, {"message": "Usuario no autenticado."})
+    except AuthorizationDenied:
+        return response(403, {"message": "No tienes permisos para actualizar diagnósticos."})
 
     try:
         service_id, changes = validate_request(event)
@@ -171,14 +112,14 @@ def lambda_handler(event, context):
 
         # Solo se construyen columnas de una lista permitida.
         assignments = ", ".join(f"{column} = %s" for column in changes)
-        values = list(changes.values()) + [service_id]
+        values = list(changes.values()) + [service_id, *access.params]
 
         with connection.cursor() as cursor:
             cursor.execute(
                 f"""
-                UPDATE public.servicios
+                UPDATE public.servicios AS svc
                 SET {assignments}
-                WHERE id = %s
+                WHERE svc.id = %s AND {access.sql}
                 RETURNING id, diagnostico, tratamiento, presupuesto;
                 """,
                 values,
