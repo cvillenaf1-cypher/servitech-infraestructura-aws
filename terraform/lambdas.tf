@@ -210,7 +210,7 @@ resource "aws_lambda_function" "actualizar_estado" {
       DB_NAME              = aws_db_instance.postgres.db_name
       DB_USER              = local.database_app_username
       EVENT_BUS_ARN        = var.lambda4_event_bus_arn == null ? "" : var.lambda4_event_bus_arn
-      COGNITO_USER_POOL_ID = var.lambda4_cognito_user_pool_arn == null ? "" : split("/", var.lambda4_cognito_user_pool_arn)[1]
+      COGNITO_USER_POOL_ID = aws_cognito_user_pool.servitech.id
     }
   }
 
@@ -228,7 +228,10 @@ resource "aws_lambda_function" "actualizar_estado" {
 
   depends_on = [
     aws_iam_role_policy_attachment.lambda4_vpc_access,
-    aws_iam_role_policy.lambda4_proxy_connect
+    aws_iam_role_policy.lambda4_proxy_connect,
+    aws_iam_role_policy.lambda4_cognito_lookup,
+    aws_vpc_security_group_ingress_rule.cognito_from_lambda4,
+    aws_vpc_security_group_egress_rule.lambda4_to_cognito
   ]
 }
 
@@ -249,24 +252,20 @@ resource "aws_iam_role" "lambda5_exec" {
 }
 
 resource "aws_iam_role_policy_attachment" "lambda5_vpc_access" {
+  # Se conserva la dirección Terraform; Lambda 5 ya no necesita permisos ENI.
   role       = aws_iam_role.lambda5_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-resource "aws_iam_role_policy" "lambda5_proxy_connect" {
-  name = "${local.name_prefix}-lambda5-proxy-connect"
+resource "aws_iam_role_policy" "lambda5_consultar" {
+  name = "${local.name_prefix}-lambda5-consultar"
   role = aws_iam_role.lambda5_exec.id
-
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
-      Action = "rds-db:connect"
-      Resource = replace(
-        aws_db_proxy.postgres.arn,
-        "/^arn:([^:]+):rds:([^:]+):([^:]+):db-proxy:(prx-[^:]+)$/",
-        "arn:$1:rds-db:$2:$3:dbuser:$4/${local.database_app_username}"
-      )
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.consultar_servicio.arn
     }]
   })
 }
@@ -295,35 +294,21 @@ resource "aws_lambda_function" "gestionar_evidencias" {
   architectures = ["x86_64"]
   handler       = "lambda_function.lambda_handler"
   memory_size   = 256
-  timeout       = 15
+  timeout       = 25
 
   filename         = "${path.module}/../build/gestionar_evidencias.zip"
   source_code_hash = filebase64sha256("${path.module}/../build/gestionar_evidencias.zip")
 
   environment {
     variables = {
-      DB_HOST           = aws_db_proxy.postgres.endpoint
-      DB_PORT           = tostring(aws_db_instance.postgres.port)
-      DB_NAME           = aws_db_instance.postgres.db_name
-      DB_USER           = local.database_app_username
-      EVIDENCIAS_BUCKET = aws_s3_bucket.evidencias.bucket
+      CONSULTAR_SERVICIO_FUNCTION = aws_lambda_function.consultar_servicio.arn
+      EVIDENCIAS_BUCKET           = aws_s3_bucket.evidencias.bucket
     }
-  }
-
-  vpc_config {
-    subnet_ids = [
-      aws_subnet.private_app_a.id,
-      aws_subnet.private_app_b.id
-    ]
-
-    security_group_ids = [
-      aws_security_group.rds_proxy_client.id
-    ]
   }
 
   depends_on = [
     aws_iam_role_policy_attachment.lambda5_vpc_access,
-    aws_iam_role_policy.lambda5_proxy_connect,
+    aws_iam_role_policy.lambda5_consultar,
     aws_iam_role_policy.lambda5_s3_access
   ]
 }
@@ -346,9 +331,13 @@ resource "aws_iam_role_policy" "lambda4_eventbridge_publish" {
 }
 
 
-resource "aws_iam_role_policy" "lambda4_cognito_lookup" {
-  count = var.lambda4_cognito_user_pool_arn == null ? 0 : 1
+# Conserva la política si la entrada opcional anterior ya la había creado.
+moved {
+  from = aws_iam_role_policy.lambda4_cognito_lookup[0]
+  to   = aws_iam_role_policy.lambda4_cognito_lookup
+}
 
+resource "aws_iam_role_policy" "lambda4_cognito_lookup" {
   name = "${local.name_prefix}-lambda4-cognito-read"
   role = aws_iam_role.lambda4_exec.id
 
@@ -356,8 +345,13 @@ resource "aws_iam_role_policy" "lambda4_cognito_lookup" {
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = "cognito-idp:ListUsers"
-      Resource = var.lambda4_cognito_user_pool_arn
+      Action   = ["cognito-idp:ListUsers", "cognito-idp:AdminGetUser"]
+      Resource = aws_cognito_user_pool.servitech.arn
+      Condition = {
+        StringEquals = {
+          "aws:SourceVpce" = aws_vpc_endpoint.cognito_idp.id
+        }
+      }
     }]
   })
 }

@@ -1,6 +1,11 @@
 output "frontend_url" {
   description = "URL HTTPS del frontend servido por CloudFront."
-  value       = "https://${aws_cloudfront_distribution.frontend.domain_name}"
+  value       = local.frontend_url
+}
+
+output "frontend_api_url" {
+  description = "API del portal a través de CloudFront, con el mismo origen."
+  value       = "${local.frontend_url}/api"
 }
 
 output "api_url" {
@@ -66,4 +71,19 @@ output "database_proxy_connect_arn" {
 output "database_instance_arn" {
   description = "ARN de la instancia RDS PostgreSQL."
   value       = aws_db_instance.postgres.arn
+}
+
+output "cognito_user_pool_id" {
+  description = "ID del User Pool para el SDK y ActualizarEstado."
+  value       = aws_cognito_user_pool.servitech.id
+}
+
+output "cognito_user_pool_arn" {
+  description = "ARN del User Pool para el futuro autorizador REST y permisos de lectura Cognito."
+  value       = aws_cognito_user_pool.servitech.arn
+}
+
+output "cognito_app_client_id" {
+  description = "ID público del App Client del portal; no tiene secreto."
+  value       = aws_cognito_user_pool_client.portal.id
 }

@@ -60,6 +60,7 @@ resource "aws_security_group" "rds" {
 
 # Acceso directo del MVP; se conserva durante la transición a RDS Proxy.
 resource "aws_vpc_security_group_ingress_rule" "rds_from_lambda" {
+  description       = "Permite PostgreSQL desde Lambda hacia RDS"
   security_group_id = aws_security_group.rds.id
 
   referenced_security_group_id = aws_security_group.lambda.id
@@ -85,6 +86,7 @@ resource "aws_security_group" "secrets_endpoint" {
 
 # El endpoint acepta HTTPS solamente desde las Lambdas.
 resource "aws_vpc_security_group_ingress_rule" "secrets_from_lambda" {
+  description       = "Permite HTTPS desde Lambda hacia Secrets Manager"
   security_group_id = aws_security_group.secrets_endpoint.id
 
   referenced_security_group_id = aws_security_group.lambda.id

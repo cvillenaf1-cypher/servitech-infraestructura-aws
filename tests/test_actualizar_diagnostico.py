@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lambda" / "shared"))
+
 sys.modules.setdefault("boto3", types.ModuleType("boto3"))
 sys.modules.setdefault("psycopg2", types.ModuleType("psycopg2"))
 
@@ -73,7 +75,7 @@ class TestActualizarDiagnostico(unittest.TestCase):
             side_effect=AssertionError("ID inválido no debe usar BD"),
         ):
             resultado = modulo.lambda_handler(
-                evento("tecnico-123", ["Tecnico"]), None
+                evento("tecnico-123", ["Técnico"]), None
             )
 
         # Superó la autorización y llegó a validar el ID.

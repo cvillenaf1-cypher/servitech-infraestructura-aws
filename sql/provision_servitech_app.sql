@@ -34,5 +34,6 @@ GRANT INSERT (servicio_id, version, estado_anterior, estado_nuevo, actor_sub)
 GRANT USAGE ON SEQUENCE public.servicios_id_seq TO servitech_app;
 
 \ir grant_servicio_outbox.sql
+\ir grant_sedes_lectura.sql
 
 COMMIT;

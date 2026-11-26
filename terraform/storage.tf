@@ -74,9 +74,10 @@ resource "aws_s3_bucket_cors_configuration" "evidencias" {
   cors_rule {
     allowed_headers = ["Content-Type"]
     allowed_methods = ["GET", "PUT"]
-    allowed_origins = [
-      "https://${aws_cloudfront_distribution.frontend.domain_name}"
-    ]
+    allowed_origins = distinct([
+      "https://${aws_cloudfront_distribution.frontend.domain_name}",
+      local.frontend_url
+    ])
     expose_headers  = ["ETag"]
     max_age_seconds = 300
   }

@@ -5,20 +5,11 @@ import json
 import os
 
 import boto3
+from servitech_authz import (
+    AuthenticationError, AuthorizationDenied, identity_from_rest_event,
+    service_access_predicate, STAFF_ROLES, CLIENTE, response,
+)
 import psycopg2
-
-
-def response(status_code, body):
-    return {
-        "statusCode": status_code,
-        "headers": {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Content-Type",
-            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-            "Content-Type": "application/json",
-        },
-        "body": json.dumps(body),
-    }
 
 
 def get_service_id(event):
@@ -81,14 +72,12 @@ def lambda_handler(event, context):
         return response(400, {"message": str(error)})
 
     try:
-        cliente_sub = event["requestContext"]["authorizer"]["claims"]["sub"]
-    except (KeyError, TypeError):
+        identity = identity_from_rest_event(event)
+        access = service_access_predicate(identity, allow_owner=True, staff_roles=STAFF_ROLES)
+    except AuthenticationError:
         return response(401, {"message": "Usuario no autenticado."})
-
-    if not isinstance(cliente_sub, str) or not cliente_sub.strip():
-        return response(401, {"message": "Usuario no autenticado."})
-
-    cliente_sub = cliente_sub.strip()
+    except AuthorizationDenied:
+        return response(403, {"message": "Acceso no autorizado."})
 
     connection = None
     try:
@@ -102,10 +91,10 @@ def lambda_handler(event, context):
                     equipo,
                     descripcion,
                     fecha_registro
-                FROM public.servicios
-                WHERE id = %s AND cliente_sub = %s;
-                """,
-                (service_id, cliente_sub),
+                FROM public.servicios AS svc
+                WHERE svc.id = %s AND
+                """ + access.sql,
+                (service_id, *access.params),
             )
             service = cursor.fetchone()
 

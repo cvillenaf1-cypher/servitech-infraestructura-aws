@@ -4,7 +4,10 @@ import re
 import uuid
 
 import boto3
-import psycopg2
+from servitech_authz import (
+    AuthenticationError, AuthorizationDenied, identity_from_rest_event,
+    service_access_predicate, STAFF_ROLES, response,
+)
 from botocore.config import Config
 
 
@@ -15,41 +18,48 @@ TIPOS_PERMITIDOS = {
 }
 
 
-def response(status, body):
-    return {
-        "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json",
-        },
-        "body": json.dumps(body),
+class ConsultaNoDisponible(RuntimeError):
+    pass
+
+
+def verificar_acceso(servicio_id, identity):
+    # Solo reenviar identidad ya validada del autorizador. IAM limita la
+    # invocación a ConsultarServicio; no hay flag para saltarse su autorización.
+    payload = {
+        "pathParameters": {"id": str(servicio_id)},
+        "requestContext": {"authorizer": {"claims": {
+            "sub": identity.sub, "cognito:groups": sorted(identity.groups),
+        }}},
     }
-
-
-def get_connection():
-    host = os.environ["DB_HOST"]
-    port = int(os.environ["DB_PORT"])
-    region = os.environ["AWS_REGION"]
-    username = os.environ["DB_USER"]
-
-    token = boto3.client(
-        "rds", region_name=region
-    ).generate_db_auth_token(
-        DBHostname=host,
-        Port=port,
-        DBUsername=username,
-        Region=region,
-    )
-
-    return psycopg2.connect(
-        host=host,
-        port=port,
-        dbname=os.environ["DB_NAME"],
-        user=username,
-        password=token,
-        sslmode="verify-full",
-        sslrootcert="/var/task/amazon-trust-roots.pem",
-        connect_timeout=5,
-    )
+    try:
+        client = boto3.client("lambda", config=Config(
+            connect_timeout=1, read_timeout=18, retries={"total_max_attempts": 1},
+        ))
+        result = client.invoke(
+            FunctionName=os.environ["CONSULTAR_SERVICIO_FUNCTION"],
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+        stream = result.get("Payload")
+        if stream is None:
+            raise ConsultaNoDisponible()
+        try:
+            reply = json.loads(stream.read())
+        finally:
+            stream.close()
+        if result.get("StatusCode") != 200 or result.get("FunctionError"):
+            raise ConsultaNoDisponible()
+        if reply.get("statusCode") in (401, 403, 404):
+            return reply["statusCode"] if reply["statusCode"] != 401 else 403
+        if reply.get("statusCode") != 200:
+            raise ConsultaNoDisponible()
+        # No emitir URL ante una respuesta incompleta o para otro servicio.
+        returned_id = json.loads(reply["body"]).get("id")
+        if type(returned_id) is not int or returned_id != servicio_id:
+            raise ConsultaNoDisponible()
+        return 200
+    except Exception as error:
+        raise ConsultaNoDisponible() from error
 
 
 def validar_solicitud(event):
@@ -71,16 +81,8 @@ def validar_solicitud(event):
     if servicio_id <= 0:
         raise ValueError("ID inválido.")
 
-    contexto = event.get("requestContext") or {}
-    autorizador = contexto.get("authorizer") or {}
-    claims = autorizador.get("claims") or {}
-
-    if not isinstance(claims, dict):
-        return servicio_id, None, None
-
-    usuario_sub = claims.get("sub")
-    if not isinstance(usuario_sub, str) or not usuario_sub.strip():
-        return servicio_id, None, None
+    identity = identity_from_rest_event(event)
+    service_access_predicate(identity, allow_owner=True, staff_roles=STAFF_ROLES)
 
     body = event.get("body")
 
@@ -93,34 +95,7 @@ def validar_solicitud(event):
     if not isinstance(body, dict):
         raise ValueError("Se requiere un body JSON.")
 
-    return servicio_id, usuario_sub.strip(), body
-
-
-def verificar_propietario(servicio_id, usuario_sub):
-    conexion = get_connection()
-
-    try:
-        with conexion.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT cliente_sub
-                FROM public.servicios
-                WHERE id = %s;
-                """,
-                (servicio_id,),
-            )
-            resultado = cursor.fetchone()
-
-        if resultado is None:
-            return 404
-
-        if not resultado[0] or resultado[0] != usuario_sub:
-            return 403
-
-        return 200
-
-    finally:
-        conexion.close()
+    return servicio_id, identity, body
 
 
 def generar_url_subida(s3, bucket, servicio_id, body, expiracion):
@@ -195,16 +170,9 @@ def generar_url_descarga(s3, bucket, servicio_id, body, expiracion):
 
 def lambda_handler(event, context):
     try:
-        servicio_id, usuario_sub, body = validar_solicitud(event)
+        servicio_id, identity, body = validar_solicitud(event)
 
-        if usuario_sub is None:
-            return response(
-                401, {"message": "Usuario no autenticado."}
-            )
-
-        estado = verificar_propietario(
-            servicio_id, usuario_sub
-        )
+        estado = verificar_acceso(servicio_id, identity)
 
         if estado == 404:
             return response(
@@ -239,6 +207,15 @@ def lambda_handler(event, context):
             raise ValueError("Acción inválida.")
 
         return response(200, resultado)
+
+    except AuthenticationError:
+        return response(401, {"message": "Usuario no autenticado."})
+
+    except AuthorizationDenied:
+        return response(403, {"message": "Acceso no autorizado."})
+
+    except ConsultaNoDisponible:
+        return response(503, {"message": "No se pudo validar el acceso al servicio."})
 
     except ValueError as error:
         return response(400, {"message": str(error)})

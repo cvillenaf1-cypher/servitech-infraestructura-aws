@@ -6,6 +6,9 @@
     <meta name="description" content="Registra y consulta los servicios técnicos de ServiTech.">
     <title>ServiTech | Servicios técnicos</title>
     <link rel="stylesheet" href="./styles.css">
+    <script src="./config.js" defer></script>
+    <script src="./vendor/amazon-cognito-identity.min.js" defer></script>
+    <script src="./auth.js" defer></script>
     <script src="./app.js" defer></script>
   </head>
   <body>
@@ -21,16 +24,44 @@
       </div>
       <p id="api-notice" class="notice" role="status">La conexión con la API está pendiente de configuración. Por ahora no se pueden registrar ni consultar servicios.</p>
       <noscript><p class="notice">Activa JavaScript en tu navegador para registrar y consultar servicios.</p></noscript>
+      <section class="card auth-card" aria-labelledby="login-title">
+        <h2 id="login-title">Accede a ServiTech</h2>
+        <p class="hint">Usa la cuenta proporcionada por el administrador.</p>
+        <form id="login-form">
+          <fieldset id="login-fields">
+            <legend class="sr-only">Credenciales de acceso</legend>
+            <label for="username">Usuario</label>
+            <input id="username" autocomplete="username" required>
+            <label for="password">Contraseña</label>
+            <input id="password" type="password" autocomplete="current-password" required>
+            <button type="submit">Iniciar sesión</button>
+          </fieldset>
+        </form>
+        <form id="challenge-form" hidden>
+          <fieldset id="challenge-fields">
+            <legend class="sr-only">Completar el acceso</legend>
+            <label id="challenge-label" for="challenge-answer">Nueva contraseña</label>
+            <input id="challenge-answer" type="password" autocomplete="new-password" required>
+            <button type="submit">Continuar</button>
+            <button id="cancel-login" type="button" class="secondary">Volver al inicio de sesión</button>
+          </fieldset>
+        </form>
+        <p id="auth-status" class="status" role="status" aria-live="polite"></p>
+        <button id="logout-button" type="button" hidden>Cerrar sesión</button>
+      </section>
       <div class="workspace">
         <section class="card" aria-labelledby="registrar-titulo">
           <p class="eyebrow">Nuevo ingreso</p>
           <h2 id="registrar-titulo">Registrar servicio</h2>
           <p class="hint">Todos los campos son obligatorios.</p>
           <form id="register-form" novalidate>
-            <fieldset id="register-fields">
+            <fieldset id="register-fields" disabled>
               <legend class="sr-only">Datos del nuevo servicio</legend>
               <label for="cliente">Cliente</label>
               <input id="cliente" name="cliente" type="text" maxlength="150" autocomplete="name" required>
+              <label for="sede-id">Código de sede</label>
+              <input id="sede-id" name="sede_id" type="text" aria-describedby="sede-help" required>
+              <p id="sede-help" class="hint">Indica el código de una sede activa proporcionado por ServiTech.</p>
               <label for="equipo">Equipo</label>
               <input id="equipo" name="equipo" type="text" maxlength="150" placeholder="Ej.: Laptop Lenovo ThinkPad" required>
               <label for="descripcion">Descripción</label>
@@ -45,7 +76,7 @@
           <h2 id="consultar-titulo">Consultar servicio</h2>
           <p class="hint" id="id-help">Ingresa el ID recibido al registrar el servicio.</p>
           <form id="lookup-form" novalidate>
-            <fieldset id="lookup-fields">
+            <fieldset id="lookup-fields" disabled>
               <legend class="sr-only">Identificador del servicio</legend>
               <label for="servicio-id">ID del servicio</label>
               <input id="servicio-id" name="id" type="text" inputmode="numeric" pattern="[0-9]+" aria-describedby="id-help" placeholder="Ej.: 123" required>

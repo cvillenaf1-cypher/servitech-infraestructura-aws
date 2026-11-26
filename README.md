@@ -4,6 +4,139 @@ ServiTech permite registrar y consultar servicios técnicos. Terraform administr
 la infraestructura del MVP. La demostración requiere un INSERT real en PostgreSQL
 y un SELECT del mismo registro por el ID devuelto; una respuesta simulada no basta.
 
+## Identidad, autorización y API
+
+La referencia es exclusivamente la Página 3 del diagrama oficial, junto con
+las contribuciones existentes y el [PR #1 de Checkov](https://github.com/cvillenaf1-cypher/servitech-infraestructura-aws/pull/1).
+No se incorpora el diagrama al repositorio. La región predeterminada es
+`us-east-2`; la región efectiva todavía depende de la configuración de despliegue.
+Se conserva el stage `dev`, el backend y el workspace.
+
+### Cognito y sedes
+
+- User Pool con alta administrativa, grupos exactos `Cliente`, `Técnico` y
+  `Administrador`, sin roles IAM asociados. App Client público sin secreto,
+  login SDK/SRP, sin dominio de User Pool ni OAuth. TOTP opcional; contraseñas
+  de 12 caracteres con complejidad y vigencia temporal de 3 días.
+- ID/access tokens: 15 minutos; refresh: 1 día. El App Client solo escribe
+  `name`; no puede cambiar contacto, indicadores de verificación ni permisos.
+  Outputs: `cognito_user_pool_id`, `cognito_user_pool_arn`, `cognito_app_client_id`.
+- Identidad estable: `sub` opaco, sin normalizar. No se crea `custom:sede_id`.
+  La migración aditiva 003 crea `sedes` y `usuario_sede_rol`, con PK compuesta
+  `(usuario_sub, sede_id, rol)`, FK a `sedes` e índice `(sede_id, rol)`.
+  Admite múltiples roles y sedes; ambos registros quedan inactivos por defecto.
+- `servitech_app` solo lee las nuevas tablas. El script de permisos revoca
+  concesiones directas y por columna a la app/PUBLIC y rechaza escritura
+  heredada o propiedad administrativa. Las asignaciones se gestionan con una
+  identidad administrativa separada; no se crean usuarios ni sedes ficticias.
+  Revisar también funciones externas SECURITY DEFINER y cambios futuros de IAM/SQL.
+- Las migraciones 001/002 y los históricos permanecen intactos. No se añade FK
+  desde `servicios` ni se rellenan propietarios o sedes automáticamente.
+
+| Operación | Cliente | Técnico / Administrador |
+| --- | --- | --- |
+| Registrar | Para sí mismo, indicando `sede_id` catalogada y activa | Solo si también tiene el grupo Cliente, siempre para sí mismo |
+| Consultar / subir o descargar evidencia | Servicio propio en sede válida y activa; sin asignación operativa | Grupo Cognito y asignación activa del mismo rol en la sede activa |
+| Diagnóstico / estado | Denegado por el rol Cliente | Grupo Cognito y asignación activa del mismo rol en la sede activa |
+| Administrar asignaciones o cambiar propietario/sede | No disponible en la API | No disponible en la API |
+
+No hay acceso global del Administrador ni propagación de privilegios entre sedes.
+Los servicios sin propietario válido o sede activa se deniegan, incluido el
+histórico incompleto. La regularización requiere intervención administrativa.
+
+### Módulo y flujos
+
+`lambda/shared/servitech_authz.py` se empaqueta en las cinco Lambda. Lee solo
+`requestContext.authorizer.claims`, conserva `sub` y admite grupos como CSV o
+lista de strings exactos. Rechaza `Tecnico`, grupos desconocidos y cadenas con
+comillas/corchetes. El [ejemplo REST de AWS](https://aws.amazon.com/blogs/mobile/new-real-time-multi-group-app-with-aws-amplify-graphql-build-a-twitter-community-clone/)
+usa CSV; el [token Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-id-token.html)
+contiene una lista. Confirmar el formato del evento real durante el despliegue.
+El módulo confía en API Gateway/IAM: no verifica firmas JWT ni acepta identidad
+proporcionada por body o cabeceras arbitrarias. No exponer invocación directa
+sin IAM; nunca reenviar claims del navegador sin pasar por el autorizador.
+
+Los filtros parametrizados de propiedad/rol/sede forman parte del SELECT,
+INSERT o UPDATE. Se deniega por defecto y no se cachean permisos. Una consulta
+sin fila autorizada devuelve 404, sin distinguir ausencia de falta de acceso;
+claims inválidos devuelven 401/403 y fallos de infraestructura 500/503.
+La autorización usa la vista de permisos de la sentencia SQL; una revocación
+concurrente no cancela una operación ya iniciada ni una URL prefirmada emitida.
+No se añaden protocolos de bloqueos asesores ni mecanismos administrativos nuevos.
+
+`ActualizarEstado` conserva el bloqueo de servicio y la transacción
+estado + historial + outbox. Recomprueba el filtro en el UPDATE y consulta al
+propietario en Cognito mediante el endpoint privado existente: `ListUsers`
+resuelve el username y `AdminGetUser` valida sub, cuenta habilitada, teléfono
+E.164 y `phone_number_verified=true`. Una comprobación fallida revierte todo;
+solo se publica después del commit. No se modifica el despacho del outbox.
+El endpoint/IAM siguen limitados al rol Lambda 4, pool y operaciones de lectura.
+
+`GestionarEvidencias` invoca sincrónicamente a `ConsultarServicio` con IAM limitado
+a su ARN y exige una respuesta válida para el servicio antes de firmar una URL.
+Según Página 3, Lambda 5 queda fuera de la VPC: ya no consulta PostgreSQL ni
+necesita permisos RDS/ENI; conserva acceso limitado a `servicios/*` de S3.
+No se añade NAT ni endpoint. Las URL duran 300 segundos, preservan tipos
+JPG/PNG/PDF y claves por servicio. S3 mantiene su CORS restringido al frontend.
+
+### API y validación
+
+| Método | Ruta | Lambda |
+| --- | --- | --- |
+| POST | `/servicios` | RegistrarServicio |
+| GET | `/servicios/{id}` | ConsultarServicio |
+| PATCH | `/servicios/{id}/diagnostico` | ActualizarDiagnostico |
+| PATCH | `/servicios/{id}/estado` | ActualizarEstado |
+| POST | `/servicios/{id}/evidencias` | GestionarEvidencias |
+
+Las cinco rutas usan el autorizador Cognito del pool existente y un **ID token**
+del App Client configurado en `Authorization`; el autorizador comprueba `aud`.
+OPTIONS es público. Preflight, errores de Gateway y respuestas Lambda permiten
+`Authorization`, `Content-Type` y los métodos usados. Se conserva origen `*`
+sin cookies; acotarlo al origen aprobado al completar el frontend.
+Se reutilizan API, recursos y stage. Se incorporan las correcciones aplicables
+CKV_AWS_237 (ciclo de vida REST API) y CKV_AWS_73 (X-Ray del stage) del PR #1,
+sin fusionar ni copiar cambios ajenos a este alcance.
+
+Validación local: `python -B -m unittest discover -s tests -v`, pruebas SQL
+explícitas en `tests/integration/check_authz_postgres.py`, empaquetado mediante
+`scripts/build_lambdas.ps1` o `scripts/build_lambdas_ci.sh`, `terraform fmt -check`,
+`terraform validate` y `git diff --check`. Ambos empaquetadores incluyen el módulo
+en la raíz de los cinco ZIP y limpian solo sus directorios temporales.
+No ejecutar ambos simultáneamente. ZIP, results.xml e informes no se incluyen en Git.
+
+El portal inicia sesión por SRP, admite contraseña temporal y TOTP ya enrolado,
+y envía el ID token a `/api/*` en el mismo origen. Los tokens solo viven en memoria;
+recargar exige iniciar sesión. El alta, recuperación y enrolamiento MFA siguen
+siendo administrativos. SDK `amazon-cognito-identity-js` 6.3.22 vendorizado desde
+su paquete oficial npm, con integridad SHA-512 verificada y licencias incluidas.
+
+CloudFront conserva S3 privado/OAC y añade API Gateway sin caché, reenviando
+`Authorization` sin el Host del visitante. `/api/servicios` llega a `/dev/servicios`.
+`frontend_domain = null` conserva HTTPS con el dominio de CloudFront. Para usar
+dominio propio, configurar `frontend_domain` con `name` (FQDN real) y `zone_id`
+(zona pública existente y delegada): Terraform valida ACM en `us-east-1` por DNS
+y crea alias A/AAAA. No se registra un dominio ni se crea otra zona. Si ya existen
+certificado o registros equivalentes, coordinar su importación antes de aplicar.
+El bucket frontend tiene versionado habilitado, recuperado del PR #1 de Checkov.
+
+WAF protege CloudFront (`CLOUDFRONT`, `us-east-1`) y la API (`REGIONAL`, stage
+`dev`). Ambas ACL aplican `AWSManagedRulesCommonRuleSet` sin excepciones; esta
+política base es una decisión técnica, no una lista de reglas del diagrama.
+El grupo bloquea cuerpos mayores de 8 KiB; las evidencias siguen subiendo
+directamente a S3. Validar tráfico legítimo antes de producción. Se habilitan
+métricas sin muestrear solicitudes con JWT; los logs y alarmas se coordinarán
+con Jhonatan, manteniendo la retención acordada de 14 días cuando se incorporen.
+
+Pendientes de despliegue: aplicar las migraciones con autorización; cargar sedes,
+usuarios y asignaciones reales; definir dominio/zona si se requieren; comprobar
+login, región, permisos AWS, conectividad, CORS y eventos reales.
+El flujo real de verificación telefónica/SMS sigue pendiente; no se simula.
+Las protecciones `prevent_destroy` y `deletion_protection=ACTIVE` bloquean
+`destroy-dev.yml`: el procedimiento controlado de DEV se resolverá por separado.
+El requisito de logs sigue siendo 14 días; las retenciones heredadas de 7 días
+y el resto del monitoreo se coordinan con Jhonatan. No se modifica ese trabajo.
+
 ## Arquitectura
 
 ```text
@@ -16,8 +149,9 @@ Navegador ──HTTPS──> CloudFront ──> S3 privado (HTML, CSS y JavaScri
                                                 └── CloudWatch Logs (7 días)
 ```
 
-El JavaScript servido por CloudFront llama directamente a API Gateway. Las
-Lambdas acceden a PostgreSQL dentro de la VPC; la base de datos no es pública.
+El esquema anterior resume el MVP inicial. Ahora el navegador llama a `/api/*`
+en CloudFront, que reenvía a API Gateway `/dev`. Las Lambda de datos acceden
+a PostgreSQL dentro de la VPC; la base de datos no es pública.
 
 ## Estado y dependencias de integración
 
@@ -26,9 +160,8 @@ Lambdas acceden a PostgreSQL dentro de la VPC; la base de datos no es pública.
 - La inspección inicial detectó que faltan `build/registrar_servicio.zip` y
   `build/consultar_servicio.zip`. Sin ellos, `terraform validate` falla en
   `terraform/lambdas.tf`, en las llamadas a `filebase64sha256`.
-- `frontend/app.js` contiene `API_URL_PENDIENTE`. El responsable del frontend debe
-  integrar la URL real del output `api_url`, incluido `/dev`, y coordinar su
-  publicación. Hasta entonces no se puede completar la prueba desde navegador.
+- Terraform publica `config.js` con los IDs públicos de Cognito. El frontend
+  accede mediante `frontend_api_url`; no contiene secretos ni una URL API manual.
 - Los grupos de logs y los outputs de esta rama deben incluirse en un despliegue
   coordinado. Si los grupos ya existen en AWS y no están en el estado compartido,
   el equipo debe coordinar su importación antes de aplicar; no borrarlos para
@@ -48,7 +181,7 @@ Lambdas acceden a PostgreSQL dentro de la VPC; la base de datos no es pública.
 | --- | --- |
 | Perfil AWS | `servitech` |
 | Cuenta AWS | `694188424284` |
-| Región de los recursos | `us-east-1` |
+| Región predeterminada del código | `us-east-2`; despliegue efectivo pendiente de verificar |
 | Región de IAM Identity Center | `us-east-2` |
 | Workspace compartido | `dev` |
 | Rama de monitoreo | `feat/monitoring-mvp` |
@@ -61,7 +194,8 @@ aws sts get-caller-identity --profile servitech --query Account --output text
 ```
 
 La cuenta debe ser `694188424284`. IAM Identity Center utiliza `us-east-2` para
-SSO; el despliegue permanece en `us-east-1`.
+SSO; la región principal acordada y predeterminada del código es `us-east-2`.
+Esto no confirma la región efectiva de los recursos desplegados.
 
 ## Preparación y validación
 
@@ -135,7 +269,7 @@ terraform output -raw environment
 | `api_url` | URL base real de API Gateway, incluido `/dev` |
 | `database_endpoint` | Host y puerto de PostgreSQL, accesibles desde la VPC |
 | `frontend_bucket` | Nombre del bucket S3 privado |
-| `aws_region` | Región configurada; por defecto `us-east-1` |
+| `aws_region` | Región configurada; por defecto `us-east-2` |
 | `environment` | Workspace actual; debe ser `dev` |
 
 Estos outputs no incluyen contraseñas, tokens, credenciales ni el ARN del secreto.
@@ -235,14 +369,21 @@ después de medir el uso y la latencia de préstamo en el entorno real.
 
 En una instalación nueva, el rol de migraciones ejecuta `psql -X -v
 ON_ERROR_STOP=1 -f sql/schema.sql` sobre la base `servitech`. Este punto de
-entrada de psql crea la tabla base e incluye las dos migraciones. Si el MVP ya creó
+entrada de psql crea la tabla base e incluye las tres migraciones. Si el MVP ya creó
 `public.servicios`, ejecutar `psql -X -v ON_ERROR_STOP=1 -f
 sql/migrations/001_servicios_historial.sql` si la fase 3 aún está pendiente,
-y luego `psql -X -v ON_ERROR_STOP=1 -f sql/migrations/002_servicio_outbox.sql`.
+y luego `psql -X -v ON_ERROR_STOP=1 -f sql/migrations/002_servicio_outbox.sql`
+y `psql -X -v ON_ERROR_STOP=1 -f sql/migrations/003_sedes_asignaciones.sql`.
+Si 001 y 002 ya están aplicadas, ejecutar únicamente 003. No se reescriben las
+migraciones anteriores. Para aprovisionar `servitech_app` con el script actualizado,
+las tres migraciones deben estar aplicadas previamente.
 Cada migración aplica sus cambios en una transacción y se puede volver a
 ejecutar sobre el mismo esquema. Si `servitech_app` ya existe, la identidad
 autorizada debe ejecutar `psql -X -v ON_ERROR_STOP=1 -f sql/grant_servicio_outbox.sql`
-después de la migración 002 para otorgar los permisos adicionales.
+después de la migración 002 para otorgar los permisos adicionales. La migración
+003 incluye `sql/grant_sedes_lectura.sql` y comprueba los permisos de las nuevas
+tablas; ante una excepción, no se confirma ninguno de sus cambios. Las versiones
+anteriores de esquema y datos permanecen intactas.
 Coordinar la ventana porque `ALTER TABLE` puede bloquear temporalmente el
 acceso y la creación de índices puede tardar según el volumen.
 
@@ -257,8 +398,10 @@ mediante los índices previstos y debe aplicar las reglas de acceso del equipo
 con la identidad autenticada. Un campo de propiedad o sede nulo requiere
 resolución antes de usarlo como evidencia de acceso. Quedan por definir el
 catálogo y las transiciones de estados, la moneda del presupuesto, el
-catálogo de sedes y la fuente de roles. El SQL deja esos valores a la
-integración de aplicación.
+contenido real del catálogo de sedes. La fuente de roles es Cognito y su alcance
+por sede se registra en PostgreSQL y ya se comprueba en las Lambda. El Cliente
+accede a sus propios servicios en una sede activa sin asignación operativa.
+El SQL no inventa esos valores.
 
 `ActualizarDiagnostico` utiliza `diagnostico`, `tratamiento` y `presupuesto`.
 `ActualizarEstado` debe leer y bloquear la fila del servicio con `SELECT ...
@@ -458,18 +601,18 @@ revisar junto al responsable de PostgreSQL el registro del ID creado en la tabla
 
 Con la URL real de API integrada en el frontend y publicada:
 
-1. Abrir `frontend_url` y las herramientas del desarrollador (Consola y Red).
-2. Registrar un servicio con el formulario y guardar el ID devuelto.
+1. Abrir `frontend_url`, iniciar sesión y abrir las herramientas del desarrollador.
+2. Registrar un servicio en una sede activa y guardar el ID devuelto.
 3. Consultar ese ID y comprobar que los datos coincidan.
-4. Verificar que el preflight `OPTIONS` y las solicitudes POST/GET funcionen
-   entre el origen CloudFront y API Gateway, sin errores de CORS en la consola.
+4. Verificar POST/GET por `/api/*` con `Authorization`, sin caché de respuestas
+   privadas; para evidencias comprobar el CORS de S3 desde el dominio del portal.
 
 PowerShell no aplica las restricciones CORS del navegador: aprobar el script no
 sustituye esta comprobación.
 
 ## CloudWatch Logs
 
-En la consola AWS, seleccionar la cuenta del proyecto y `us-east-1`, abrir
+En la consola AWS, seleccionar la cuenta del proyecto y `us-east-2`, abrir
 CloudWatch → Logs → Log groups y buscar, con los nombres predeterminados actuales:
 
 - `/aws/lambda/servitech-dev-registrar-servicio`
@@ -479,13 +622,13 @@ Cada grupo tiene retención de 7 días. Después de la prueba, revisar los strea
 las marcas de tiempo de ambas invocaciones. También se pueden seguir desde CLI:
 
 ```powershell
-aws logs tail /aws/lambda/servitech-dev-registrar-servicio --since 10m --follow --profile servitech --region us-east-1
+aws logs tail /aws/lambda/servitech-dev-registrar-servicio --since 10m --follow --profile servitech --region us-east-2
 ```
 
 Terminar con `Ctrl+C` y repetir para la consulta:
 
 ```powershell
-aws logs tail /aws/lambda/servitech-dev-consultar-servicio --since 10m --follow --profile servitech --region us-east-1
+aws logs tail /aws/lambda/servitech-dev-consultar-servicio --since 10m --follow --profile servitech --region us-east-2
 ```
 
 Las Lambdas actuales registran mensajes genéricos de error. No agregar al log

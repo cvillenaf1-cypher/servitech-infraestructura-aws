@@ -39,7 +39,10 @@ try {
         -Destination (Join-Path $packageDirectory "amazon-trust-roots.pem") `
         -Force
 
-foreach ($functionName in @("registrar_servicio", "consultar_servicio", "actualizar_diagnostico", "actualizar_estado", "gestionar_evidencias")) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "lambda\shared\servitech_authz.py") `
+        -Destination (Join-Path $packageDirectory "servitech_authz.py") -Force
+
+    foreach ($functionName in @("registrar_servicio", "consultar_servicio", "actualizar_diagnostico", "actualizar_estado", "gestionar_evidencias")) {
         $source = Join-Path $repoRoot "lambda\$functionName\lambda_function.py"
         Copy-Item -LiteralPath $source -Destination (Join-Path $packageDirectory "lambda_function.py") -Force
         $zipPath = Join-Path $buildDirectory "$functionName.zip"
@@ -68,5 +71,10 @@ with ZipFile(sys.argv[2], "w", compression=ZIP_DEFLATED) as archive:
     }
 }
 finally {
+    $resolvedTemporary = [System.IO.Path]::GetFullPath($temporaryDirectory)
+    $resolvedBuild = [System.IO.Path]::GetFullPath($buildDirectory).TrimEnd('\') + '\'
+    if (-not $resolvedTemporary.StartsWith($resolvedBuild, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "La ruta temporal no pertenece a build; no se elimina."
+    }
     Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force
 }
