@@ -47,15 +47,13 @@ teléfono. `cognito:groups` lo emite Cognito a partir de las membresías adminis
 no es un atributo editable del App Client. Se usa la grafía `Técnico`, ya admitida
 por las Lambda existentes.
 
-### Propuesta pendiente de sede y verificación telefónica
+### Sedes y verificación telefónica
 
-Por decisión del equipo, **no se crea todavía `custom:sede_id`**. La propuesta
-es un String opcional, con valor mutable por administración IAM autorizada y
-lectura para el App Client, excluido de `write_attributes`. Antes de incorporarlo
-se deben definir catálogo, formato, límite de longitud, soporte multisede y
-alcance del Administrador. Un atributo ausente no autoriza acceso entre sedes.
-El alta del atributo debe revisarse porque Cognito no permite eliminarlo después.
-La autorización por propietario, rol y sede se implementará en una fase posterior.
+Por decisión del equipo, **no se crea `custom:sede_id`**. Cognito administra
+identidad y grupos; PostgreSQL administra las asignaciones de usuario, rol y
+sede. El modelo admite múltiples sedes y distintos roles por sede, sin acceso
+global implícito del Administrador. La etapa 3.1 define las tablas descritas
+más adelante; aplicar estas reglas en las Lambda queda para otra etapa.
 
 El teléfono debe pertenecer al cliente propietario y tener formato E.164.
 Esta fase no configura SMS ni verificación automática, y no establece
@@ -177,6 +175,127 @@ Pendientes antes del despliegue y de la integración completa:
 Referencias: [PrivateLink y políticas de Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/vpc-interface-endpoints.html),
 [ListUsers y consistencia eventual](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_ListUsers.html),
 [AdminGetUser](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AdminGetUser.html).
+
+## Etapa 3.1: sedes y asignaciones administrativas
+
+**Alcance implementado:** esquema y permisos SQL; no se modifica ninguna Lambda
+ni se activa todavía la autorización descrita en esta sección. La Página 3 del
+diagrama exige comprobar propietario, rol y sede y reutilizar la consulta de
+acceso para evidencias. Las tablas y el soporte multisede son la solución
+aprobada por el equipo, no detalles prescritos por el diagrama.
+
+`sql/migrations/003_sedes_asignaciones.sql` es aditiva y transaccional:
+
+| Tabla | Contrato |
+| --- | --- |
+| `public.sedes` | `id` de texto, clave primaria; `nombre` obligatorio; `activa` inicialmente `false`; `creado_en` con zona horaria. Identificador y nombre no pueden estar vacíos. |
+| `public.usuario_sede_rol` | Clave primaria `(usuario_sub, sede_id, rol)`; `usuario_sub` opaco y no vacío; `sede_id` referencia a `sedes.id`; `rol` es exactamente `Cliente`, `Técnico` o `Administrador`; `activo` inicialmente `false`; `creado_en` con zona horaria. |
+
+La clave compuesta permite varios roles por sede y distintas sedes por usuario,
+sin duplicar una misma asignación. La FK restringe borrados y cambios de ID de
+sedes referenciadas; no hay cascadas. La PK indexa consultas por usuario/sede/rol
+y un índice `(sede_id, rol)` cubre consultas administrativas y la FK, incluidas
+asignaciones inactivas. No se crean usuarios SQL por cada usuario Cognito ni una
+FK hacia Cognito. Los nuevos scripts fijan la codificación de psql a UTF-8 para
+conservar la grafía `Técnico` también en clientes Windows.
+La identidad administrativa debe comprobar el `sub` real en
+el User Pool configurado; no se exige UUID ni se transforma el identificador.
+El modelo supone un solo User Pool para la aplicación; admitir varios exigiría
+incorporar el emisor a las claves antes de reutilizar identificadores.
+
+No se insertan sedes, usuarios ni asignaciones. `servicios.cliente_sub` y
+`servicios.sede_id`, sus índices, historial y outbox se conservan sin cambios.
+No se añade una FK de `servicios` a `sedes`: los registros históricos pueden
+contener NULL o identificadores aún no catalogados. No se rellenan ni corrigen
+automáticamente. Una futura regularización administrativa necesitará inventario,
+aprobación y trazabilidad antes de plantear esa FK. Una FK `NOT VALID` también
+condicionaría nuevas escrituras; por ello tampoco se incorpora en esta etapa.
+
+### Lectura de aplicación y administración separada
+
+El propietario de las tablas debe ser una identidad administrativa de migración
+separada de `servitech_app`. Las asignaciones se administran únicamente desde
+una sesión administrativa autorizada; pertenecer al grupo Cognito Administrador
+no concede acceso SQL ni permite administrar asignaciones desde la aplicación.
+No se crean credenciales, logins administrativos ni permisos IAM en esta etapa.
+
+`sql/grant_sedes_lectura.sql` otorga a `servitech_app` solo `SELECT` sobre las dos
+tablas, sin opción de concesión. Revoca sus concesiones directas y las de
+`PUBLIC`, tanto de tabla como de columna, incluidas las materializadas desde
+privilegios predeterminados al crear las tablas. Comprueba propiedad, facultades
+administrativas, `CREATE`, escritura y opciones de concesión de lectura en el
+rol y sus membresías transitivas. Incluye conservadoramente roles con membresía
+aunque `NOINHERIT` o `SET FALSE` limiten su uso actual. Si encuentra una exposición
+heredada, aborta la transacción; no cambia permisos de otros roles compartidos.
+Se deben corregir esas membresías/concesiones con autorización y volver a ejecutar.
+
+El script no modifica `ALTER DEFAULT PRIVILEGES` de los compañeros: comprueba los
+permisos efectivos resultantes sobre estas tablas. Se ejecuta dentro de la
+migración si la aplicación ya existe y desde el aprovisionamiento para nuevas
+instalaciones. Si el rol aún no existe, retira acceso de `PUBLIC` y deja un aviso;
+los permisos de aplicación se establecerán al aprovisionarlo. También se puede
+volver a ejecutar por separado: su bloque `DO` es atómico. La identidad ejecutora
+debe poder revocar todas las concesiones revisadas y no debe ser la aplicación.
+
+Antes de un despliegue autorizado, revisar también funciones `SECURITY DEFINER`
+ejecutables por la aplicación y otros caminos de elevación existentes: la
+comprobación de ACL y membresías no analiza el cuerpo de funciones externas.
+Nuevos grants, cambios de propietario o membresías posteriores necesitan revisión
+y nueva comprobación. `NOINHERIT` por sí solo no protege frente a `SET ROLE`.
+Referencias: [privilegios PostgreSQL](https://www.postgresql.org/docs/16/ddl-priv.html),
+[membresías](https://www.postgresql.org/docs/16/role-membership.html) y
+[privilegios predeterminados](https://www.postgresql.org/docs/16/sql-alterdefaultprivileges.html).
+
+Administración prevista: registrar un ID y nombre de sede reales, comprobar el
+`sub` y los grupos del usuario, registrar el rol correspondiente y activar de
+forma explícita la sede y la asignación. Para revocar, desactivar la asignación
+concreta; para suspender una sede, desactivarla. No borrar registros para revocar
+acceso. El modelo conserva el estado de la asignación y su fecha de creación,
+pero no constituye un historial de cambios administrativos: el procedimiento
+de auditoría y las identidades autorizadas para gestionarlo quedan por definir.
+
+### Matriz de autorización propuesta para la siguiente etapa
+
+Toda autorización requerirá identidad autenticada y coincidencia exacta entre
+grupo Cognito y asignación **activa del mismo rol y sede**, además de sede activa.
+Un grupo sin asignación o una asignación sin grupo no autoriza. Los roles no
+tienen jerarquía implícita: Administrador en A y Técnico en B no equivale a
+Administrador en B. En particular, el Cliente también necesita su asignación
+activa en la sede; para servicios existentes debe ser su propietario.
+
+| Operación | Cliente | Técnico | Administrador |
+| --- | --- | --- | --- |
+| Registrar servicio | Para sí mismo, en una sede autorizada | Denegado hasta definir recepción por terceros | Denegado hasta definir recepción por terceros |
+| Consultar servicio y evidencias | Propio, en sede autorizada | En sede autorizada | En sede autorizada |
+| Modificar diagnóstico/presupuesto | Denegado | En sede autorizada | En sede autorizada |
+| Cambiar estado | Denegado | En sede autorizada, según transiciones por definir | En sede autorizada, según transiciones por definir |
+| Cargar evidencia | Propia, en sede autorizada; pendiente ratificar regla de negocio | En sede autorizada | En sede autorizada |
+| Cambiar propietario/sede o administrar asignaciones desde la aplicación | Denegado | Denegado | Denegado |
+
+Se denegará por defecto si faltan identidad, propietario o sede válidos, si la
+sede/asignación está inactiva, o si PostgreSQL no permite comprobar la regla.
+Nunca se tomará del body un grupo o asignación como evidencia de autorización.
+La siguiente etapa deberá consultar estas tablas desde las Lambda, comprobar
+permisos dentro de las transacciones de escritura y resolver la concurrencia con
+revocaciones. Las pruebas de autorización deberán cubrir varios roles/sedes,
+identificadores opacos, históricos incompletos y fallos de consulta. Esta
+migración no sustituye esas comprobaciones ni añade RLS a `servicios`.
+
+Se mantiene como referencia el [PR #1 de Checkov](https://github.com/cvillenaf1-cypher/servitech-infraestructura-aws/pull/1):
+sus correcciones de SG, S3, API, RDS y monitoreo se revisarán en sus respectivas
+etapas; no contienen una migración reutilizable para este modelo. No se fusiona
+ni se copia ese PR. Se mantienen las protecciones de Cognito y el requisito de
+logs de **14 días**, sin modificar Terraform ni workflows.
+
+Pruebas SQL reproducibles: `tests/sql/test_sedes_asignaciones.sql`, exclusivamente
+en una base PostgreSQL local desechable con esquema y `servitech_app` ya
+aprovisionados. Usa datos sintéticos de prueba dentro de una transacción que
+finaliza con `ROLLBACK`; no es un script de datos iniciales. Ejecutar con
+`psql -X -v ON_ERROR_STOP=1 -f tests/sql/test_sedes_asignaciones.sql` solo contra
+esa base local. Verificar también instalación nueva, actualización con registros
+históricos, repetición de la migración y rechazo de permisos heredados antes de
+aplicar en un entorno real. Las 33 pruebas Python de regresión se ejecutan con
+`python -B -m unittest discover -s tests -v`; no validan SQL real.
 
 ## Arquitectura
 
@@ -410,14 +529,21 @@ después de medir el uso y la latencia de préstamo en el entorno real.
 
 En una instalación nueva, el rol de migraciones ejecuta `psql -X -v
 ON_ERROR_STOP=1 -f sql/schema.sql` sobre la base `servitech`. Este punto de
-entrada de psql crea la tabla base e incluye las dos migraciones. Si el MVP ya creó
+entrada de psql crea la tabla base e incluye las tres migraciones. Si el MVP ya creó
 `public.servicios`, ejecutar `psql -X -v ON_ERROR_STOP=1 -f
 sql/migrations/001_servicios_historial.sql` si la fase 3 aún está pendiente,
-y luego `psql -X -v ON_ERROR_STOP=1 -f sql/migrations/002_servicio_outbox.sql`.
+y luego `psql -X -v ON_ERROR_STOP=1 -f sql/migrations/002_servicio_outbox.sql`
+y `psql -X -v ON_ERROR_STOP=1 -f sql/migrations/003_sedes_asignaciones.sql`.
+Si 001 y 002 ya están aplicadas, ejecutar únicamente 003. No se reescriben las
+migraciones anteriores. Para aprovisionar `servitech_app` con el script actualizado,
+las tres migraciones deben estar aplicadas previamente.
 Cada migración aplica sus cambios en una transacción y se puede volver a
 ejecutar sobre el mismo esquema. Si `servitech_app` ya existe, la identidad
 autorizada debe ejecutar `psql -X -v ON_ERROR_STOP=1 -f sql/grant_servicio_outbox.sql`
-después de la migración 002 para otorgar los permisos adicionales.
+después de la migración 002 para otorgar los permisos adicionales. La migración
+003 incluye `sql/grant_sedes_lectura.sql` y comprueba los permisos de las nuevas
+tablas; ante una excepción, no se confirma ninguno de sus cambios. Las versiones
+anteriores de esquema y datos permanecen intactas.
 Coordinar la ventana porque `ALTER TABLE` puede bloquear temporalmente el
 acceso y la creación de índices puede tardar según el volumen.
 
@@ -432,8 +558,9 @@ mediante los índices previstos y debe aplicar las reglas de acceso del equipo
 con la identidad autenticada. Un campo de propiedad o sede nulo requiere
 resolución antes de usarlo como evidencia de acceso. Quedan por definir el
 catálogo y las transiciones de estados, la moneda del presupuesto, el
-catálogo de sedes y la fuente de roles. El SQL deja esos valores a la
-integración de aplicación.
+contenido real del catálogo de sedes. La fuente de roles es Cognito y su alcance
+por sede se registra en PostgreSQL según la etapa 3.1; su comprobación en las
+Lambda sigue pendiente. El SQL no inventa esos valores.
 
 `ActualizarDiagnostico` utiliza `diagnostico`, `tratamiento` y `presupuesto`.
 `ActualizarEstado` debe leer y bloquear la fila del servicio con `SELECT ...
